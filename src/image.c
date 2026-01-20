@@ -416,10 +416,27 @@ skia_put_image_to_skia_data (struct image *img)
     }
   else
     {
-      /* No mask - create image directly from pixel data.  */
+      /* No mask - create image directly from pixel data.
+	 Cairo RGB24 format has undefined alpha byte, so we need to
+	 set it to 0xFF for Skia to render correctly.  */
+      size_t data_size = pimg->bytes_per_line * pimg->height;
+      unsigned char *data_copy = xmalloc (data_size);
+      memcpy (data_copy, pimg->data, data_size);
+
+      /* Set alpha to fully opaque for all pixels.  */
+      for (int y = 0; y < pimg->height; y++)
+	for (int x = 0; x < pimg->width; x++)
+	  {
+	    uint32_t *pixel
+	      = (uint32_t *) (data_copy + y * pimg->bytes_per_line)
+		+ x;
+	    *pixel = (*pixel & 0x00FFFFFF) | 0xFF000000;
+	  }
+
       img->skia_data = emacs_skia_image_create_from_bgra_pixels (
-	pimg->width, pimg->height, pimg->data, pimg->bytes_per_line,
+	pimg->width, pimg->height, data_copy, pimg->bytes_per_line,
 	false);
+      xfree (data_copy);
     }
 }
 #endif /* USE_SKIA */
