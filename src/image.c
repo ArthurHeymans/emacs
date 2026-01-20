@@ -372,6 +372,60 @@ cr_put_image_to_cr_data (struct image *img)
 
 #endif /* USE_CAIRO || USE_SKIA */
 
+#ifdef USE_SKIA
+/* Create a Skia image from pixel containers.
+   This is called before cr_put_image_to_cr_data (which frees the
+   pixel data) for hybrid builds, or called lazily for SKIA_NO_CAIRO
+   builds.  */
+static void
+skia_put_image_to_skia_data (struct image *img)
+{
+  Emacs_Pix_Container pimg = img->pixmap;
+  Emacs_Pix_Container mask = img->mask;
+
+  if (!pimg || !pimg->data)
+    return;
+
+  /* For images with masks, we need to premultiply alpha.
+     Cairo does this in cr_create_surface_from_pix_containers.
+     For Skia, we create a copy with premultiplied alpha.  */
+  if (mask && mask->data)
+    {
+      /* Create a copy of the pixel data with premultiplied alpha.  */
+      size_t data_size = pimg->bytes_per_line * pimg->height;
+      unsigned char *data_copy = xmalloc (data_size);
+      memcpy (data_copy, pimg->data, data_size);
+
+      for (int y = 0; y < pimg->height; y++)
+	for (int x = 0; x < pimg->width; x++)
+	  {
+	    uint32_t *pixel
+	      = (uint32_t *) (data_copy + y * pimg->bytes_per_line)
+		+ x;
+	    uint8_t alpha = ((
+	      uint8_t *) (mask->data + y * mask->bytes_per_line))[x];
+	    uint32_t color = *pixel;
+	    int r = ((color >> 16) & 0xff) * alpha / 255;
+	    int g = ((color >> 8) & 0xff) * alpha / 255;
+	    int b = (color & 0xff) * alpha / 255;
+	    *pixel = (alpha << 24) | (r << 16) | (g << 8) | b;
+	  }
+
+      img->skia_data = emacs_skia_image_create_from_bgra_pixels (
+	pimg->width, pimg->height, data_copy, pimg->bytes_per_line,
+	true);
+      xfree (data_copy);
+    }
+  else
+    {
+      /* No mask - create image directly from pixel data.  */
+      img->skia_data = emacs_skia_image_create_from_bgra_pixels (
+	pimg->width, pimg->height, pimg->data, pimg->bytes_per_line,
+	false);
+    }
+}
+#endif /* USE_SKIA */
+
 #ifdef HAVE_NS
 /* Use with images created by ns_image_for_XPM.  */
 static unsigned long
@@ -1880,6 +1934,12 @@ prepare_image_for_display (struct frame *f, struct image *img)
 	     we have img->pixmap->data/img->mask->data.  */
 	  IMAGE_BACKGROUND (img, f, img->pixmap);
 	  IMAGE_BACKGROUND_TRANSPARENT (img, f, img->mask);
+# ifdef USE_SKIA
+	  /* Create Skia image BEFORE cr_put_image_to_cr_data,
+	     which frees the pixel data.  */
+	  if (img->skia_data == NULL)
+	    skia_put_image_to_skia_data (img);
+# endif
 	  cr_put_image_to_cr_data (img);
 	  if (img->cr_data == NULL)
 	    {
@@ -1890,13 +1950,15 @@ prepare_image_for_display (struct frame *f, struct image *img)
       unblock_input ();
     }
 #elif defined(USE_SKIA)
-  /* For Skia, we keep the pixmap data as-is since we use Cairo-style
-     pixel containers but don't need cr_data pattern conversion.  */
+  /* For Skia without Cairo, create Skia image from pixel containers.
+   */
   if (!img->load_failed_p)
     {
       block_input ();
       IMAGE_BACKGROUND (img, f, img->pixmap);
       IMAGE_BACKGROUND_TRANSPARENT (img, f, img->mask);
+      if (img->skia_data == NULL)
+	skia_put_image_to_skia_data (img);
       unblock_input ();
     }
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
@@ -2173,6 +2235,14 @@ image_clear_image_1 (struct frame *f, struct image *img, int flags)
       img->cr_data = NULL;
     }
 #endif /* USE_CAIRO */
+
+#ifdef USE_SKIA
+  if (img->skia_data)
+    {
+      emacs_skia_image_destroy (img->skia_data);
+      img->skia_data = NULL;
+    }
+#endif /* USE_SKIA */
 }
 
 /* Free X resources of image IMG which is used on frame F.  */

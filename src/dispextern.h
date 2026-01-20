@@ -3230,6 +3230,11 @@ struct image
 # if defined(USE_CAIRO) || defined(USE_SKIA)
   void *cr_data;
 # endif
+# ifdef USE_SKIA
+  /* Skia image for this image (separate from cr_data for hybrid
+   * builds) */
+  void *skia_data;
+# endif
 # ifdef HAVE_X_WINDOWS
   /* X images of the image, corresponding to the above Pixmaps.
      Non-NULL means it and its Pixmap counterpart may be out of sync

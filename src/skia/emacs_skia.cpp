@@ -31,14 +31,34 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 #include "core/SkFontMgr.h"
 #include "core/SkImage.h"
 #include "core/SkPaint.h"
+#include "core/SkPath.h"
+#include "core/SkPathEffect.h"
+#include "core/SkShader.h"
 #include "core/SkStream.h"
 #include "core/SkSurface.h"
+#include "core/SkTileMode.h"
 #include "core/SkTypeface.h"
+#include "effects/SkDashPathEffect.h"
 
 /* Platform-specific font manager for Linux (fontconfig) */
 #ifdef HAVE_FONTCONFIG
+# include <fontconfig/fontconfig.h>
 # include "ports/SkFontMgr_fontconfig.h"
 # include "ports/SkFontScanner_FreeType.h"
+#endif
+
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <memory>
+
+/* PDF and SVG support */
+#ifdef SK_PDF
+# include "docs/SkPDFDocument.h"
+#endif
+
+#ifdef SK_SVG
+# include "svg/SkSVGCanvas.h"
 #endif
 
 #ifdef SK_GL
@@ -85,6 +105,11 @@ struct emacs_skia_typeface
 struct emacs_skia_image
 {
   sk_sp<SkImage> image;
+};
+
+struct emacs_skia_path
+{
+  SkPath path;
 };
 
 #ifdef SK_GL
@@ -140,6 +165,12 @@ to_sk_blend_mode (emacs_skia_blend_mode_t mode)
       return SkBlendMode::kDstOver;
     case EMACS_SKIA_BLEND_CLEAR:
       return SkBlendMode::kClear;
+    case EMACS_SKIA_BLEND_XOR:
+      return SkBlendMode::kXor;
+    case EMACS_SKIA_BLEND_DIFFERENCE:
+      return SkBlendMode::kDifference;
+    case EMACS_SKIA_BLEND_EXCLUSION:
+      return SkBlendMode::kExclusion;
     default:
       return SkBlendMode::kSrcOver;
     }
@@ -489,6 +520,19 @@ emacs_skia_canvas_save (emacs_skia_canvas_t *canvas)
 }
 
 void
+emacs_skia_canvas_save_layer (emacs_skia_canvas_t *canvas,
+			      const emacs_skia_rect_t *bounds)
+{
+  if (canvas && canvas->canvas)
+    {
+      if (bounds)
+	canvas->canvas->saveLayer (to_sk_rect (bounds), nullptr);
+      else
+	canvas->canvas->saveLayer (nullptr, nullptr);
+    }
+}
+
+void
 emacs_skia_canvas_restore (emacs_skia_canvas_t *canvas)
 {
   if (canvas && canvas->canvas)
@@ -541,6 +585,20 @@ emacs_skia_canvas_clip_irect (emacs_skia_canvas_t *canvas,
   if (canvas && canvas->canvas && rect)
     {
       canvas->canvas->clipIRect (to_sk_irect (rect));
+    }
+}
+
+void
+emacs_skia_canvas_get_clip_bounds (emacs_skia_canvas_t *canvas,
+				   emacs_skia_rect_t *bounds)
+{
+  if (canvas && canvas->canvas && bounds)
+    {
+      SkRect sk_bounds = canvas->canvas->getLocalClipBounds ();
+      bounds->left = sk_bounds.left ();
+      bounds->top = sk_bounds.top ();
+      bounds->right = sk_bounds.right ();
+      bounds->bottom = sk_bounds.bottom ();
     }
 }
 
@@ -611,6 +669,14 @@ emacs_skia_canvas_draw_glyphs (emacs_skia_canvas_t *canvas, int count,
       return;
     }
 
+  /* Debug: Check clip bounds when drawing near bottom */
+  if (origin.y > 1300)
+    {
+      SkRect clip_bounds = canvas->canvas->getLocalClipBounds ();
+      fprintf (stderr, "DRAWGLYPH: y=%.0f clip_bottom=%.0f\n",
+	       origin.y, clip_bounds.bottom ());
+    }
+
   /* Convert positions to SkPoint array */
   std::vector<SkPoint> sk_positions (count);
   for (int i = 0; i < count; i++)
@@ -662,6 +728,86 @@ emacs_skia_canvas_draw_image_rect (emacs_skia_canvas_t *canvas,
 				 to_sk_rect (dst), sampling,
 				 paint ? &paint->paint : nullptr,
 				 SkCanvas::kStrict_SrcRectConstraint);
+}
+
+void
+emacs_skia_canvas_draw_path (emacs_skia_canvas_t *canvas,
+			     emacs_skia_path_t *path,
+			     emacs_skia_paint_t *paint)
+{
+  if (canvas && canvas->canvas && path && paint)
+    {
+      canvas->canvas->drawPath (path->path, paint->paint);
+    }
+}
+
+void
+emacs_skia_canvas_draw_arc (emacs_skia_canvas_t *canvas,
+			    const emacs_skia_rect_t *oval,
+			    float start_angle, float sweep_angle,
+			    bool use_center,
+			    emacs_skia_paint_t *paint)
+{
+  if (!canvas || !canvas->canvas || !oval || !paint)
+    return;
+
+  canvas->canvas->drawArc (to_sk_rect (oval), start_angle,
+			   sweep_angle, use_center, paint->paint);
+}
+
+void
+emacs_skia_canvas_draw_image_with_mask (emacs_skia_canvas_t *canvas,
+					emacs_skia_image_t *image,
+					emacs_skia_image_t *mask,
+					float x, float y,
+					emacs_skia_paint_t *paint)
+{
+  if (!canvas || !canvas->canvas || !image || !image->image)
+    return;
+
+  /* If no mask, just draw the image normally */
+  if (!mask || !mask->image)
+    {
+      emacs_skia_canvas_draw_image (canvas, image, x, y, paint);
+      return;
+    }
+
+  /* Use a layer with mask as alpha:
+     1. Save the canvas state and create a layer
+     2. Draw the mask as the alpha channel
+     3. Draw the image with SrcIn blend mode (uses mask alpha)
+     4. Restore the layer */
+  canvas->canvas->save ();
+
+  SkRect bounds = SkRect::MakeXYWH (x, y, image->image->width (),
+				    image->image->height ());
+  canvas->canvas->saveLayer (bounds, nullptr);
+
+  /* Draw mask as grayscale (will become alpha) */
+  SkSamplingOptions sampling (SkFilterMode::kNearest);
+  canvas->canvas->drawImage (mask->image.get (), x, y, sampling,
+			     nullptr);
+
+  /* Draw image with SrcIn to use mask as alpha */
+  SkPaint srcInPaint;
+  srcInPaint.setBlendMode (SkBlendMode::kSrcIn);
+  if (paint)
+    srcInPaint.setColor (paint->paint.getColor ());
+  canvas->canvas->drawImage (image->image.get (), x, y, sampling,
+			     &srcInPaint);
+
+  canvas->canvas->restore (); /* Restore layer */
+  canvas->canvas->restore (); /* Restore original state */
+}
+
+void
+emacs_skia_canvas_clip_path (emacs_skia_canvas_t *canvas,
+			     emacs_skia_path_t *path)
+{
+  if (canvas && canvas->canvas && path)
+    {
+      canvas->canvas->clipPath (path->path);
+    }
 }
 
 /* ============================================================
@@ -747,6 +893,52 @@ emacs_skia_paint_set_stroke_width (emacs_skia_paint_t *paint,
     }
 }
 
+void
+emacs_skia_paint_set_dash (emacs_skia_paint_t *paint,
+			   const float *intervals, int count,
+			   float phase)
+{
+  if (!paint || !intervals || count < 2)
+    return;
+
+  /* Skia requires SkScalar array, which is float */
+  auto effect = SkDashPathEffect::Make (intervals, count, phase);
+  paint->paint.setPathEffect (effect);
+}
+
+void
+emacs_skia_paint_clear_dash (emacs_skia_paint_t *paint)
+{
+  if (paint)
+    {
+      paint->paint.setPathEffect (nullptr);
+    }
+}
+
+void
+emacs_skia_paint_set_image_shader (emacs_skia_paint_t *paint,
+				   emacs_skia_image_t *image)
+{
+  if (!paint || !image || !image->image)
+    return;
+
+  /* Create a tiled shader from the image */
+  SkSamplingOptions sampling (SkFilterMode::kNearest);
+  auto shader
+    = image->image->makeShader (SkTileMode::kRepeat,
+				SkTileMode::kRepeat, sampling);
+  paint->paint.setShader (shader);
+}
+
+void
+emacs_skia_paint_clear_shader (emacs_skia_paint_t *paint)
+{
+  if (paint)
+    {
+      paint->paint.setShader (nullptr);
+    }
+}
+
 /* ============================================================
    Font and Typeface
    ============================================================ */
@@ -820,6 +1012,60 @@ void
 emacs_skia_typeface_destroy (emacs_skia_typeface_t *typeface)
 {
   delete typeface;
+}
+
+#ifdef HAVE_FONTCONFIG
+emacs_skia_typeface_t *
+emacs_skia_typeface_create_from_fc_pattern (FcPattern *pattern)
+{
+  if (!pattern)
+    return nullptr;
+
+  /* Extract the font file path and index from the pattern */
+  FcChar8 *file = nullptr;
+  int index = 0;
+
+  if (FcPatternGetString (pattern, FC_FILE, 0, &file) != FcResultMatch
+      || !file)
+    return nullptr;
+
+  FcPatternGetInteger (pattern, FC_INDEX, 0, &index);
+
+  sk_sp<SkFontMgr> fontMgr = get_font_mgr ();
+  if (!fontMgr)
+    return nullptr;
+
+  /* Load the typeface from file with the specified face index */
+  auto typeface
+    = fontMgr->makeFromFile (reinterpret_cast<const char *> (file),
+			     index);
+  if (!typeface)
+    return nullptr;
+
+  auto result = new emacs_skia_typeface_t;
+  result->typeface = typeface;
+  return result;
+}
+#endif
+
+const char *
+emacs_skia_typeface_get_path (emacs_skia_typeface_t *typeface)
+{
+  /* Skia doesn't expose the font file path directly.
+     This would need platform-specific code or tracking during
+     creation. For now, return nullptr - callers should use the path
+     they originally provided.  */
+  (void) typeface;
+  return nullptr;
+}
+
+int
+emacs_skia_typeface_get_index (emacs_skia_typeface_t *typeface)
+{
+  /* Skia doesn't expose the face index directly.
+     Return 0 as the default.  */
+  (void) typeface;
+  return 0;
 }
 
 emacs_skia_font_t *
@@ -910,6 +1156,83 @@ emacs_skia_font_get_metrics (emacs_skia_font_t *font,
   metrics->cap_height = sk_metrics.fCapHeight;
 }
 
+void
+emacs_skia_font_get_extents (emacs_skia_font_t *font,
+			     emacs_skia_font_extents_t *extents)
+{
+  if (!font || !extents)
+    return;
+
+  SkFontMetrics sk_metrics;
+  font->font.getMetrics (&sk_metrics);
+
+  /* Cairo convention: ascent and descent are positive values.
+     Skia convention: ascent is negative (distance up from baseline).
+   */
+  extents->ascent = -sk_metrics.fAscent;
+  extents->descent = sk_metrics.fDescent;
+  extents->height
+    = -sk_metrics.fAscent + sk_metrics.fDescent + sk_metrics.fLeading;
+  extents->max_x_advance = sk_metrics.fMaxCharWidth;
+  extents->max_y_advance = 0; /* Horizontal fonts */
+}
+
+void
+emacs_skia_font_get_glyph_extents (
+  emacs_skia_font_t *font, const emacs_skia_glyph_t *glyphs,
+  int count, emacs_skia_glyph_extents_t *extents)
+{
+  if (!font || !glyphs || !extents || count <= 0)
+    return;
+
+  /* Get bounds and widths for all glyphs */
+  std::vector<SkRect> bounds (count);
+  std::vector<SkScalar> widths (count);
+
+  SkSpan<const SkGlyphID> glyph_span (glyphs, count);
+  SkSpan<SkScalar> width_span (widths.data (), count);
+  SkSpan<SkRect> bounds_span (bounds.data (), count);
+
+  font->font.getWidthsBounds (glyph_span, width_span, bounds_span,
+			      nullptr);
+
+  /* Convert to emacs_skia_glyph_extents_t format
+     (compatible with Cairo's cairo_text_extents_t) */
+  for (int i = 0; i < count; i++)
+    {
+      extents[i].x_bearing = bounds[i].left ();
+      extents[i].y_bearing = bounds[i].top ();
+      extents[i].width = bounds[i].width ();
+      extents[i].height = bounds[i].height ();
+      extents[i].x_advance = widths[i];
+      extents[i].y_advance = 0; /* Horizontal fonts */
+    }
+}
+
+void
+emacs_skia_font_get_glyph_bounds (emacs_skia_font_t *font,
+				  const emacs_skia_glyph_t *glyphs,
+				  int count,
+				  emacs_skia_rect_t *bounds)
+{
+  if (!font || !glyphs || !bounds || count <= 0)
+    return;
+
+  std::vector<SkRect> sk_bounds (count);
+  SkSpan<const SkGlyphID> glyph_span (glyphs, count);
+  SkSpan<SkRect> bounds_span (sk_bounds.data (), count);
+
+  font->font.getBounds (glyph_span, bounds_span, nullptr);
+
+  for (int i = 0; i < count; i++)
+    {
+      bounds[i].left = sk_bounds[i].left ();
+      bounds[i].top = sk_bounds[i].top ();
+      bounds[i].right = sk_bounds[i].right ();
+      bounds[i].bottom = sk_bounds[i].bottom ();
+    }
+}
+
 int
 emacs_skia_font_text_to_glyphs (emacs_skia_font_t *font,
 				const char *text, size_t byte_length,
@@ -997,6 +1320,33 @@ emacs_skia_image_create_from_pixels (int width, int height,
 }
 
 emacs_skia_image_t *
+emacs_skia_image_create_from_bgra_pixels (int width, int height,
+					  const void *pixels,
+					  size_t row_bytes,
+					  bool has_alpha)
+{
+  /* BGRA is Cairo's native format on little-endian machines.
+     Skia supports BGRA natively with kBGRA_8888_SkColorType. */
+  SkColorType colorType = kBGRA_8888_SkColorType;
+  SkAlphaType alphaType
+    = has_alpha ? kPremul_SkAlphaType : kOpaque_SkAlphaType;
+  SkImageInfo info
+    = SkImageInfo::Make (width, height, colorType, alphaType);
+
+  auto image = SkImages::RasterFromPixmapCopy (
+    SkPixmap (info, pixels, row_bytes));
+
+  if (!image)
+    {
+      return nullptr;
+    }
+
+  auto result = new emacs_skia_image_t;
+  result->image = image;
+  return result;
+}
+
+emacs_skia_image_t *
 emacs_skia_image_create_from_encoded (const void *data, size_t size)
 {
   auto skdata = SkData::MakeWithCopy (data, size);
@@ -1029,3 +1379,357 @@ emacs_skia_image_get_height (emacs_skia_image_t *image)
 {
   return image && image->image ? image->image->height () : 0;
 }
+
+emacs_skia_image_t *
+emacs_skia_image_create_from_bitmap (const unsigned char *data,
+				     int width, int height,
+				     int stride)
+{
+  if (!data || width <= 0 || height <= 0)
+    return nullptr;
+
+  /* Calculate stride if not provided */
+  if (stride <= 0)
+    stride = (width + 7) / 8;
+
+  /* Convert 1-bit packed data to 8-bit alpha.
+     Cairo A1 format: MSB first, rows padded to 32-bit boundary.
+     We convert to Skia A8 format for compatibility.  */
+  int a8_stride = width;
+  std::vector<uint8_t> a8_data (width * height);
+
+  for (int y = 0; y < height; y++)
+    {
+      const unsigned char *src_row = data + y * stride;
+      uint8_t *dst_row = a8_data.data () + y * a8_stride;
+
+      for (int x = 0; x < width; x++)
+	{
+	  int byte_idx = x / 8;
+	  int bit_idx = 7 - (x % 8); /* MSB first */
+	  bool bit_set = (src_row[byte_idx] >> bit_idx) & 1;
+	  dst_row[x] = bit_set ? 255 : 0;
+	}
+    }
+
+  /* Create A8 (alpha-only) image */
+  SkImageInfo info
+    = SkImageInfo::Make (width, height, kAlpha_8_SkColorType,
+			 kPremul_SkAlphaType);
+  auto image = SkImages::RasterFromPixmapCopy (
+    SkPixmap (info, a8_data.data (), a8_stride));
+
+  if (!image)
+    return nullptr;
+
+  auto result = new emacs_skia_image_t;
+  result->image = image;
+  return result;
+}
+
+/* ============================================================
+   Path
+   ============================================================ */
+
+emacs_skia_path_t *
+emacs_skia_path_create (void)
+{
+  return new emacs_skia_path_t;
+}
+
+void
+emacs_skia_path_destroy (emacs_skia_path_t *path)
+{
+  delete path;
+}
+
+void
+emacs_skia_path_reset (emacs_skia_path_t *path)
+{
+  if (path)
+    path->path.reset ();
+}
+
+void
+emacs_skia_path_move_to (emacs_skia_path_t *path, float x, float y)
+{
+  if (path)
+    path->path.moveTo (x, y);
+}
+
+void
+emacs_skia_path_line_to (emacs_skia_path_t *path, float x, float y)
+{
+  if (path)
+    path->path.lineTo (x, y);
+}
+
+void
+emacs_skia_path_rel_line_to (emacs_skia_path_t *path, float dx,
+			     float dy)
+{
+  if (path)
+    path->path.rLineTo (dx, dy);
+}
+
+void
+emacs_skia_path_arc_to (emacs_skia_path_t *path,
+			const emacs_skia_rect_t *oval,
+			float start_angle, float sweep_angle,
+			bool force_move_to)
+{
+  if (!path || !oval)
+    return;
+
+  /* Skia arcTo uses forceMoveTo parameter */
+  path->path.arcTo (to_sk_rect (oval), start_angle, sweep_angle,
+		    force_move_to);
+}
+
+void
+emacs_skia_path_close (emacs_skia_path_t *path)
+{
+  if (path)
+    path->path.close ();
+}
+
+void
+emacs_skia_path_add_rect (emacs_skia_path_t *path,
+			  const emacs_skia_rect_t *rect)
+{
+  if (path && rect)
+    path->path.addRect (to_sk_rect (rect));
+}
+
+/* ============================================================
+   Document Export (PDF/SVG)
+   ============================================================ */
+
+/* Custom SkWStream that writes to a callback function.  */
+class CallbackWStream : public SkWStream
+{
+public:
+  CallbackWStream (emacs_skia_write_fn fn, void *ctx)
+      : write_fn_ (fn), ctx_ (ctx), bytes_written_ (0)
+  {
+  }
+
+  bool write (const void *buffer, size_t size) override
+  {
+    if (!write_fn_)
+      return false;
+    size_t written = write_fn_ (ctx_, buffer, size);
+    bytes_written_ += written;
+    return written == size;
+  }
+
+  void flush () override
+  {
+    /* Callback stream doesn't buffer, so nothing to flush.  */
+  }
+
+  size_t bytesWritten () const override { return bytes_written_; }
+
+private:
+  emacs_skia_write_fn write_fn_;
+  void *ctx_;
+  size_t bytes_written_;
+};
+
+struct emacs_skia_document
+{
+#ifdef SK_PDF
+  sk_sp<SkDocument> document;
+  std::unique_ptr<CallbackWStream> stream;
+  SkCanvas *current_page; /* Borrowed from document */
+#else
+  int dummy;
+#endif
+};
+
+/* Canvas wrapper for SVG that owns its stream.  */
+struct emacs_skia_svg_canvas_data
+{
+  std::unique_ptr<CallbackWStream> stream;
+  std::unique_ptr<SkCanvas> canvas;
+};
+
+#ifdef SK_PDF
+emacs_skia_document_t *
+emacs_skia_document_create_pdf (emacs_skia_write_fn write_fn,
+				void *write_ctx, float width,
+				float height)
+{
+  auto stream
+    = std::make_unique<CallbackWStream> (write_fn, write_ctx);
+
+  SkPDF::Metadata metadata;
+  /* Could add metadata like title, creator, etc. here.  */
+
+  auto document = SkPDF::MakeDocument (stream.get (), metadata);
+  if (!document)
+    return nullptr;
+
+  auto result = new emacs_skia_document_t;
+  result->document = document;
+  result->stream = std::move (stream);
+  result->current_page = nullptr;
+
+  return result;
+}
+
+emacs_skia_canvas_t *
+emacs_skia_document_begin_page (emacs_skia_document_t *doc,
+				float width, float height)
+{
+  if (!doc || !doc->document)
+    return nullptr;
+
+  /* End any existing page first.  */
+  if (doc->current_page)
+    {
+      doc->document->endPage ();
+      doc->current_page = nullptr;
+    }
+
+  doc->current_page
+    = doc->document->beginPage (width, height, nullptr);
+  if (!doc->current_page)
+    return nullptr;
+
+  /* Return a wrapper - we use a static because the canvas is
+     owned by the document.  */
+  static emacs_skia_canvas_t canvas_wrapper;
+  canvas_wrapper.canvas = doc->current_page;
+  return &canvas_wrapper;
+}
+
+void
+emacs_skia_document_end_page (emacs_skia_document_t *doc)
+{
+  if (doc && doc->document && doc->current_page)
+    {
+      doc->document->endPage ();
+      doc->current_page = nullptr;
+    }
+}
+
+void
+emacs_skia_document_close (emacs_skia_document_t *doc)
+{
+  if (doc)
+    {
+      if (doc->document)
+	{
+	  /* End any open page.  */
+	  if (doc->current_page)
+	    doc->document->endPage ();
+	  doc->document->close ();
+	}
+      delete doc;
+    }
+}
+#else
+/* Stub implementations when PDF support is not compiled in.  */
+emacs_skia_document_t *
+emacs_skia_document_create_pdf (emacs_skia_write_fn write_fn,
+				void *write_ctx, float width,
+				float height)
+{
+  (void) write_fn;
+  (void) write_ctx;
+  (void) width;
+  (void) height;
+  return nullptr;
+}
+
+emacs_skia_canvas_t *
+emacs_skia_document_begin_page (emacs_skia_document_t *doc,
+				float width, float height)
+{
+  (void) doc;
+  (void) width;
+  (void) height;
+  return nullptr;
+}
+
+void
+emacs_skia_document_end_page (emacs_skia_document_t *doc)
+{
+  (void) doc;
+}
+
+void
+emacs_skia_document_close (emacs_skia_document_t *doc)
+{
+  (void) doc;
+}
+#endif
+
+#ifdef SK_SVG
+/* Global map to track SVG canvas data.
+   This is needed because we return a generic emacs_skia_canvas_t
+   pointer but need to track the underlying stream ownership.  */
+static std::map<SkCanvas *, emacs_skia_svg_canvas_data *>
+  svg_canvas_map;
+
+emacs_skia_canvas_t *
+emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
+			      void *write_ctx, float width,
+			      float height)
+{
+  auto stream
+    = std::make_unique<CallbackWStream> (write_fn, write_ctx);
+
+  SkRect bounds = SkRect::MakeWH (width, height);
+  auto canvas = SkSVGCanvas::Make (bounds, stream.get ());
+  if (!canvas)
+    return nullptr;
+
+  /* Store the canvas data so we can clean up later.  */
+  auto data = new emacs_skia_svg_canvas_data;
+  data->stream = std::move (stream);
+  data->canvas = std::move (canvas);
+
+  svg_canvas_map[data->canvas.get ()] = data;
+
+  static emacs_skia_canvas_t canvas_wrapper;
+  canvas_wrapper.canvas = data->canvas.get ();
+  return &canvas_wrapper;
+}
+
+void
+emacs_skia_svg_canvas_finish (emacs_skia_canvas_t *canvas)
+{
+  if (!canvas || !canvas->canvas)
+    return;
+
+  auto it = svg_canvas_map.find (canvas->canvas);
+  if (it != svg_canvas_map.end ())
+    {
+      emacs_skia_svg_canvas_data *data = it->second;
+      /* Deleting the canvas flushes and finishes the SVG output.  */
+      svg_canvas_map.erase (it);
+      delete data;
+    }
+}
+#else
+/* Stub implementations when SVG support is not compiled in.  */
+emacs_skia_canvas_t *
+emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
+			      void *write_ctx, float width,
+			      float height)
+{
+  (void) write_fn;
+  (void) write_ctx;
+  (void) width;
+  (void) height;
+  return nullptr;
+}
+
+void
+emacs_skia_svg_canvas_finish (emacs_skia_canvas_t *canvas)
+{
+  (void) canvas;
+}
+#endif
