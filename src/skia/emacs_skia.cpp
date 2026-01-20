@@ -32,6 +32,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 #include "core/SkImage.h"
 #include "core/SkPaint.h"
 #include "core/SkPath.h"
+#include "core/SkPathBuilder.h"
 #include "core/SkPathEffect.h"
 #include "core/SkShader.h"
 #include "core/SkStream.h"
@@ -109,7 +110,7 @@ struct emacs_skia_image
 
 struct emacs_skia_path
 {
-  SkPath path;
+  SkPathBuilder builder;
 };
 
 #ifdef SK_GL
@@ -737,7 +738,9 @@ emacs_skia_canvas_draw_path (emacs_skia_canvas_t *canvas,
 {
   if (canvas && canvas->canvas && path && paint)
     {
-      canvas->canvas->drawPath (path->path, paint->paint);
+      /* Convert builder to path for drawing.  */
+      canvas->canvas->drawPath (path->builder.snapshot (),
+				paint->paint);
     }
 }
 
@@ -806,7 +809,8 @@ emacs_skia_canvas_clip_path (emacs_skia_canvas_t *canvas,
 {
   if (canvas && canvas->canvas && path)
     {
-      canvas->canvas->clipPath (path->path);
+      /* Convert builder to path for clipping.  */
+      canvas->canvas->clipPath (path->builder.snapshot ());
     }
 }
 
@@ -901,8 +905,11 @@ emacs_skia_paint_set_dash (emacs_skia_paint_t *paint,
   if (!paint || !intervals || count < 2)
     return;
 
-  /* Skia requires SkScalar array, which is float */
-  auto effect = SkDashPathEffect::Make (intervals, count, phase);
+  /* Skia requires SkScalar array, which is float.
+     Newer Skia versions use SkSpan instead of pointer+count.  */
+  auto effect
+    = SkDashPathEffect::Make (SkSpan<const float> (intervals, count),
+			      phase);
   paint->paint.setPathEffect (effect);
 }
 
@@ -1447,21 +1454,21 @@ void
 emacs_skia_path_reset (emacs_skia_path_t *path)
 {
   if (path)
-    path->path.reset ();
+    path->builder.reset ();
 }
 
 void
 emacs_skia_path_move_to (emacs_skia_path_t *path, float x, float y)
 {
   if (path)
-    path->path.moveTo (x, y);
+    path->builder.moveTo (x, y);
 }
 
 void
 emacs_skia_path_line_to (emacs_skia_path_t *path, float x, float y)
 {
   if (path)
-    path->path.lineTo (x, y);
+    path->builder.lineTo (x, y);
 }
 
 void
@@ -1469,7 +1476,7 @@ emacs_skia_path_rel_line_to (emacs_skia_path_t *path, float dx,
 			     float dy)
 {
   if (path)
-    path->path.rLineTo (dx, dy);
+    path->builder.rLineTo (dx, dy);
 }
 
 void
@@ -1481,16 +1488,16 @@ emacs_skia_path_arc_to (emacs_skia_path_t *path,
   if (!path || !oval)
     return;
 
-  /* Skia arcTo uses forceMoveTo parameter */
-  path->path.arcTo (to_sk_rect (oval), start_angle, sweep_angle,
-		    force_move_to);
+  /* SkPathBuilder::arcTo uses forceMoveTo parameter.  */
+  path->builder.arcTo (to_sk_rect (oval), start_angle, sweep_angle,
+		       force_move_to);
 }
 
 void
 emacs_skia_path_close (emacs_skia_path_t *path)
 {
   if (path)
-    path->path.close ();
+    path->builder.close ();
 }
 
 void
@@ -1498,7 +1505,7 @@ emacs_skia_path_add_rect (emacs_skia_path_t *path,
 			  const emacs_skia_rect_t *rect)
 {
   if (path && rect)
-    path->path.addRect (to_sk_rect (rect));
+    path->builder.addRect (to_sk_rect (rect));
 }
 
 /* ============================================================
