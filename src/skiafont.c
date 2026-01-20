@@ -421,15 +421,10 @@ skiafont_draw (struct glyph_string *s, int from, int to, int x, int y,
     }
 
   /* Apply clipping from glyph string to prevent drawing outside
-   * bounds.  */
+     bounds.  */
   {
     XRectangle clip_rects[2];
     int n = get_glyph_string_clip_rects (s, clip_rects, 2);
-    /* Debug: print clip info for rows near bottom (y > 1300) */
-    if (y > 1300 && n > 0)
-      fprintf (stderr, "CLIPDBG: y=%d clip_bottom=%d mode_line=%d\n",
-	       y, clip_rects[0].y + clip_rects[0].height,
-	       s->row ? s->row->mode_line_p : -1);
     for (int j = 0; j < n; j++)
       {
 	emacs_skia_irect_t clip
