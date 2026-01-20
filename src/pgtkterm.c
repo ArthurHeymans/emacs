@@ -129,6 +129,8 @@ static void pgtk_fill_rectangle (struct frame *, unsigned long, int,
 #ifdef USE_SKIA
 static void pgtk_skia_fill_rectangle (struct frame *, unsigned long,
 				      int, int, int, int, bool);
+static void pgtk_skia_draw_rectangle (struct frame *, unsigned long,
+				      int, int, int, int, bool);
 #endif
 static void pgtk_clip_to_row (struct window *, struct glyph_row *,
 			      enum glyph_row_area, cairo_t *);
@@ -1373,6 +1375,43 @@ static void
 fill_background_by_face (struct frame *f, struct face *face, int x,
 			 int y, int width, int height)
 {
+#ifdef USE_SKIA
+  /* For stippled backgrounds, fall back to Cairo since Skia doesn't
+     have pattern/mask support yet.  */
+  if (face->stipple != 0)
+    {
+      cairo_t *cr = pgtk_begin_cr_clip (f);
+      double r, g, b, a;
+
+      cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+      cairo_rectangle (cr, x, y, width, height);
+      cairo_clip (cr);
+
+      r = ((face->background >> 16) & 0xff) / 255.0;
+      g = ((face->background >> 8) & 0xff) / 255.0;
+      b = ((face->background >> 0) & 0xff) / 255.0;
+      a = f->alpha_background;
+      cairo_set_source_rgba (cr, r, g, b, a);
+      cairo_paint (cr);
+
+      cairo_pattern_t *mask
+	= FRAME_DISPLAY_INFO (f)->bitmaps[face->stipple - 1].pattern;
+
+      r = ((face->foreground >> 16) & 0xff) / 255.0;
+      g = ((face->foreground >> 8) & 0xff) / 255.0;
+      b = ((face->foreground >> 0) & 0xff) / 255.0;
+      cairo_set_source_rgba (cr, r, g, b, a);
+      cairo_mask (cr, mask);
+
+      pgtk_end_cr_clip (f);
+    }
+  else
+    {
+      /* Simple solid fill - use Skia.  */
+      pgtk_skia_fill_rectangle (f, face->background, x, y, width,
+				height, true);
+    }
+#else
   cairo_t *cr = pgtk_begin_cr_clip (f);
   double r, g, b, a;
 
@@ -1400,6 +1439,7 @@ fill_background_by_face (struct frame *f, struct face *face, int x,
     }
 
   pgtk_end_cr_clip (f);
+#endif
 }
 
 static void
@@ -1456,6 +1496,10 @@ pgtk_draw_rectangle (struct frame *f, unsigned long color, int x,
 		     int y, int width, int height,
 		     bool respect_alpha_background)
 {
+#ifdef USE_SKIA
+  pgtk_skia_draw_rectangle (f, color, x, y, width, height,
+			    respect_alpha_background);
+#else
   cairo_t *cr;
 
   cr = pgtk_begin_cr_clip (f);
@@ -1464,6 +1508,7 @@ pgtk_draw_rectangle (struct frame *f, unsigned long color, int x,
   cairo_set_line_width (cr, 1);
   cairo_stroke (cr);
   pgtk_end_cr_clip (f);
+#endif
 }
 
 /* Draw the foreground of glyph string S.  */
@@ -3437,18 +3482,21 @@ pgtk_draw_vertical_window_border (struct window *w, int x, int y0,
 {
   struct frame *f = XFRAME (WINDOW_FRAME (w));
   struct face *face;
-  cairo_t *cr;
-
-  cr = pgtk_begin_cr_clip (f);
 
   face = FACE_FROM_ID_OR_NULL (f, VERTICAL_BORDER_FACE_ID);
-  if (face)
-    pgtk_set_cr_source_with_color (f, face->foreground, false);
+  unsigned long color
+    = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
 
+#ifdef USE_SKIA
+  pgtk_skia_fill_rectangle (f, color, x, y0, 1, y1 - y0, false);
+#else
+  cairo_t *cr;
+  cr = pgtk_begin_cr_clip (f);
+  pgtk_set_cr_source_with_color (f, color, false);
   cairo_rectangle (cr, x, y0, 1, y1 - y0);
   cairo_fill (cr);
-
   pgtk_end_cr_clip (f);
+#endif
 }
 
 /* Draw a window divider from (x0,y0) to (x1,y1)  */
@@ -3471,49 +3519,72 @@ pgtk_draw_window_divider (struct window *w, int x0, int x1, int y0,
 		  : FRAME_FOREGROUND_PIXEL (f));
   unsigned long color_last = (face_last ? face_last->foreground
 					: FRAME_FOREGROUND_PIXEL (f));
+  bool alpha = f->borders_respect_alpha_background;
+
+#ifdef USE_SKIA
+  if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
+    /* Vertical.  */
+    {
+      pgtk_skia_fill_rectangle (f, color_first, x0, y0, 1, y1 - y0,
+				alpha);
+      pgtk_skia_fill_rectangle (f, color, x0 + 1, y0, x1 - x0 - 2,
+				y1 - y0, alpha);
+      pgtk_skia_fill_rectangle (f, color_last, x1 - 1, y0, 1, y1 - y0,
+				alpha);
+    }
+  else if (x1 - x0 > y1 - y0 && y1 - y0 > 3)
+    /* Horizontal.  */
+    {
+      pgtk_skia_fill_rectangle (f, color_first, x0, y0, x1 - x0, 1,
+				alpha);
+      pgtk_skia_fill_rectangle (f, color, x0, y0 + 1, x1 - x0,
+				y1 - y0 - 2, alpha);
+      pgtk_skia_fill_rectangle (f, color_last, x0, y1 - 1, x1 - x0, 1,
+				alpha);
+    }
+  else
+    {
+      pgtk_skia_fill_rectangle (f, color, x0, y0, x1 - x0, y1 - y0,
+				alpha);
+    }
+#else
   cairo_t *cr = pgtk_begin_cr_clip (f);
 
   if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
     /* Vertical.  */
     {
-      pgtk_set_cr_source_with_color (
-	f, color_first, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color_first, alpha);
       cairo_rectangle (cr, x0, y0, 1, y1 - y0);
       cairo_fill (cr);
-      pgtk_set_cr_source_with_color (
-	f, color, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color, alpha);
       cairo_rectangle (cr, x0 + 1, y0, x1 - x0 - 2, y1 - y0);
       cairo_fill (cr);
-      pgtk_set_cr_source_with_color (
-	f, color_last, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color_last, alpha);
       cairo_rectangle (cr, x1 - 1, y0, 1, y1 - y0);
       cairo_fill (cr);
     }
   else if (x1 - x0 > y1 - y0 && y1 - y0 > 3)
     /* Horizontal.  */
     {
-      pgtk_set_cr_source_with_color (
-	f, color_first, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color_first, alpha);
       cairo_rectangle (cr, x0, y0, x1 - x0, 1);
       cairo_fill (cr);
-      pgtk_set_cr_source_with_color (
-	f, color, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color, alpha);
       cairo_rectangle (cr, x0, y0 + 1, x1 - x0, y1 - y0 - 2);
       cairo_fill (cr);
-      pgtk_set_cr_source_with_color (
-	f, color_last, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color_last, alpha);
       cairo_rectangle (cr, x0, y1 - 1, x1 - x0, 1);
       cairo_fill (cr);
     }
   else
     {
-      pgtk_set_cr_source_with_color (
-	f, color, f->borders_respect_alpha_background);
+      pgtk_set_cr_source_with_color (f, color, alpha);
       cairo_rectangle (cr, x0, y0, x1 - x0, y1 - y0);
       cairo_fill (cr);
     }
 
   pgtk_end_cr_clip (f);
+#endif
 }
 
 /* End update of frame F.  This function is installed as a hook in
@@ -7822,6 +7893,33 @@ pgtk_skia_fill_rectangle (struct frame *f, unsigned long color, int x,
 
   emacs_skia_irect_t rect = { x, y, x + width, y + height };
   emacs_skia_canvas_draw_irect (canvas, &rect, FRAME_SKIA_PAINT (f));
+
+  pgtk_end_skia_clip (f);
+}
+
+/* Skia version of draw rectangle (stroked outline).  */
+static void
+pgtk_skia_draw_rectangle (struct frame *f, unsigned long color, int x,
+			  int y, int width, int height,
+			  bool respect_alpha_background)
+{
+  emacs_skia_canvas_t *canvas = pgtk_begin_skia_clip (f);
+  if (!canvas)
+    return;
+
+  emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
+  pgtk_skia_set_paint_color (f, color, respect_alpha_background);
+  emacs_skia_paint_set_stroke (paint, true);
+  emacs_skia_paint_set_stroke_width (paint, 1.0f);
+
+  /* Use float rect for proper stroke alignment (0.5 offset for crisp
+   * lines).  */
+  emacs_skia_rect_t rect
+    = { x + 0.5f, y + 0.5f, x + width + 0.5f, y + height + 0.5f };
+  emacs_skia_canvas_draw_rect (canvas, &rect, paint);
+
+  /* Reset to fill mode for subsequent operations.  */
+  emacs_skia_paint_set_stroke (paint, false);
 
   pgtk_end_skia_clip (f);
 }
