@@ -4594,6 +4594,19 @@ if test "$HAVE_SKIA" = "yes"; then
 fi
 AC_SUBST([SKIA_CXX_OBJ])
 
+dnl Option to build Skia without Cairo dependency (experimental)
+AC_ARG_WITH([skia-no-cairo],
+  [AS_HELP_STRING([--with-skia-no-cairo],
+    [Build Skia backend without Cairo dependency (experimental).
+     Some features like bitmap fonts and font caching may be limited.])],
+  [], [with_skia_no_cairo=no])
+
+if test "$with_skia_no_cairo" = "yes" && test "$HAVE_SKIA" = "yes"; then
+  AC_DEFINE([SKIA_NO_CAIRO], [1],
+    [Define to 1 to build Skia backend without Cairo dependency.])
+  AC_MSG_NOTICE([Building Skia backend without Cairo (experimental)])
+fi
+
 if test "$window_system" = "pgtk"; then
   dnl For PGTK, either Cairo or Skia is required
   if test "$HAVE_SKIA" = "yes"; then

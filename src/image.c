@@ -374,9 +374,7 @@ cr_put_image_to_cr_data (struct image *img)
 
 #ifdef USE_SKIA
 /* Create a Skia image from pixel containers.
-   This is called before cr_put_image_to_cr_data (which frees the
-   pixel data) for hybrid builds, or called lazily for SKIA_NO_CAIRO
-   builds.  */
+   This converts the pixel data into a Skia image for rendering.  */
 static void
 skia_put_image_to_skia_data (struct image *img)
 {
@@ -748,7 +746,11 @@ image_create_bitmap_from_data (struct frame *f, char *bits,
 
 #ifdef HAVE_PGTK
   dpyinfo->bitmaps[id - 1].depth = 1;
+# ifdef USE_SKIA
+  dpyinfo->bitmaps[id - 1].skia_image = NULL; /* Created on demand */
+# else
   dpyinfo->bitmaps[id - 1].pattern = pattern;
+# endif
 #endif
 
 #ifdef HAVE_HAIKU
@@ -932,8 +934,15 @@ image_create_bitmap_from_file (struct frame *f, Lisp_Object file)
   dpyinfo->bitmaps[id - 1].file = xlispstrdup (file);
   dpyinfo->bitmaps[id - 1].height = width;
   dpyinfo->bitmaps[id - 1].width = height;
+# ifdef USE_SKIA
+  dpyinfo->bitmaps[id - 1].skia_image
+    = emacs_skia_image_create_from_bitmap ((unsigned char *) data,
+					   width, height,
+					   (width + 7) / 8);
+# else
   dpyinfo->bitmaps[id - 1].pattern
     = image_bitmap_to_cr_pattern (data, width, height);
+# endif
   xfree (contents);
   xfree (data);
   return id;
@@ -1186,8 +1195,13 @@ free_bitmap_record (Display_Info *dpyinfo, Bitmap_Record *bm)
 #endif
 
 #ifdef HAVE_PGTK
+# ifdef USE_SKIA
+  if (bm->skia_image != NULL)
+    emacs_skia_image_destroy (bm->skia_image);
+# else
   if (bm->pattern != NULL)
     cairo_pattern_destroy (bm->pattern);
+# endif
 #endif
 
 #ifdef HAVE_HAIKU

@@ -909,16 +909,43 @@ pgtk_set_scroll_bar_background (struct frame *f,
 
 /***********************************************************************
 			       Printing
-       ***********************************************************************/
+	***********************************************************************/
 
 DEFUN ("x-export-frames", Fx_export_frames, Sx_export_frames, 0, 2, 0,
        doc:/* SKIP: real doc in xfns.c.  */)
 (Lisp_Object frames, Lisp_Object type)
 {
 #ifdef USE_SKIA
-  /* Frame export not yet implemented for Skia backend.  */
-  error ("Frame export not supported with Skia backend");
-  return Qnil;
+  /* Use Skia for frame export.  */
+  Lisp_Object rest, tmp;
+
+  if (!CONSP (frames))
+    frames = list1 (frames);
+
+  tmp = Qnil;
+  for (rest = frames; CONSP (rest); rest = XCDR (rest))
+    {
+      struct frame *f = decode_window_system_frame (XCAR (rest));
+      Lisp_Object frame;
+
+      XSETFRAME (frame, f);
+      if (!FRAME_VISIBLE_P (f))
+	error ("Frames to be exported must be visible");
+      tmp = Fcons (frame, tmp);
+    }
+  frames = Fnreverse (tmp);
+
+  /* Skia supports PDF and SVG.  PostScript is dropped per plan.  */
+  if (!NILP (type) && !EQ (type, Qpdf) && !EQ (type, Qsvg))
+    {
+      if (EQ (type, Qpostscript))
+	error ("PostScript export not supported with Skia backend");
+      if (EQ (type, Qpng))
+	error ("PNG export not yet supported with Skia backend");
+      error ("Unsupported export type");
+    }
+
+  return pgtk_skia_export_frames (frames, type);
 #else /* !USE_SKIA */
   Lisp_Object rest, tmp;
   cairo_surface_type_t surface_type;
@@ -1772,7 +1799,11 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 
   FRAME_X_OUTPUT (f)->border_color_css_provider = NULL;
 
+#ifdef USE_SKIA
+  FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
+#else
   FRAME_X_OUTPUT (f)->cr_surface_visible_bell = NULL;
+#endif
   FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
   FRAME_X_OUTPUT (f)->watched_scale_factor = 1.0;
   struct timespec ts = make_timespec (1, 0);
@@ -2035,9 +2066,8 @@ pgtk_set_defaults_value (const char *key, const char *value)
 
 #endif
 
-DEFUN ("pgtk-set-resource", Fpgtk_set_resource, Spgtk_set_resource, 2, 2, 0,
-       doc: /* Set the value of ATTRIBUTE, of class CLASS, as VALUE, into defaults database. */ )
-  (Lisp_Object attribute, Lisp_Object value)
+DEFUN ("pgtk-set-resource", Fpgtk_set_resource, Spgtk_set_resource, 2, 2, 0, doc:/* Set the value of ATTRIBUTE, of class CLASS, as VALUE, into defaults database.  */)
+(Lisp_Object attribute, Lisp_Object value)
 {
   check_window_system (NULL);
 

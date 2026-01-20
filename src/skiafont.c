@@ -16,20 +16,23 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 
-/* This font driver uses FreeType for font discovery and metrics,
-   but renders glyphs using Skia.  */
+/* This font driver uses FreeType for font discovery and Skia for
+   rendering.  It uses Skia for all font metrics and rendering.  */
 
 #include <config.h>
 
 #ifdef USE_SKIA
 
-# include <cairo-ft.h>
+# include <fontconfig/fontconfig.h>
+# include <ft2build.h>
 # include <math.h>
+# include FT_FREETYPE_H
 
 # include "lisp.h"
 # include "blockinput.h"
 # include "charset.h"
 # include "composite.h"
+# include "dispextern.h"
 # include "font.h"
 # include "ftfont.h"
 # include "pdumper.h"
@@ -65,7 +68,9 @@ static int
 skiafont_glyph_extents (struct font *font, unsigned glyph,
 			struct font_metrics *metrics)
 {
-  struct font_info *ftfont_info = (struct font_info *) font;
+  struct skia_font_info *skiafont_info
+    = (struct skia_font_info *) font;
+  struct font_info *ftfont_info = &skiafont_info->base;
   int row, col;
   struct font_metrics *cache;
 
@@ -96,17 +101,30 @@ skiafont_glyph_extents (struct font *font, unsigned glyph,
 
   if (METRICS_STATUS (cache) == METRICS_INVALID)
     {
-      /* Use Cairo for metrics since it's already available.  */
-      cairo_glyph_t cr_glyph = { .index = glyph };
-      cairo_text_extents_t extents;
+      /* Get glyph extents from Skia.  */
+      if (skiafont_info->skia_font)
+	{
+	  emacs_skia_glyph_t skia_glyph = glyph;
+	  emacs_skia_glyph_extents_t extents;
 
-      cairo_scaled_font_glyph_extents (ftfont_info->cr_scaled_font,
-				       &cr_glyph, 1, &extents);
-      cache->lbearing = floor (extents.x_bearing);
-      cache->rbearing = ceil (extents.width + extents.x_bearing);
-      cache->width = lround (extents.x_advance);
-      cache->ascent = ceil (-extents.y_bearing - 1.0 / 256);
-      cache->descent = ceil (extents.height + extents.y_bearing);
+	  emacs_skia_font_get_glyph_extents (skiafont_info->skia_font,
+					     &skia_glyph, 1,
+					     &extents);
+	  cache->lbearing = floor (extents.x_bearing);
+	  cache->rbearing = ceil (extents.width + extents.x_bearing);
+	  cache->width = lround (extents.x_advance);
+	  cache->ascent = ceil (-extents.y_bearing - 1.0 / 256);
+	  cache->descent = ceil (extents.height + extents.y_bearing);
+	}
+      else
+	{
+	  /* Fallback: return zero metrics if no Skia font.  */
+	  cache->lbearing = 0;
+	  cache->rbearing = 0;
+	  cache->width = 0;
+	  cache->ascent = 0;
+	  cache->descent = 0;
+	}
     }
 
   if (metrics)
@@ -127,6 +145,21 @@ skiafont_match (struct frame *f, Lisp_Object spec)
   return ftfont_match2 (f, spec, Qskia);
 }
 
+/* FreeType library handle for direct font access.  */
+static FT_Library ft_library;
+static bool ft_library_initialized;
+
+static bool
+skiafont_init_freetype (void)
+{
+  if (!ft_library_initialized)
+    {
+      if (FT_Init_FreeType (&ft_library) == 0)
+	ft_library_initialized = true;
+    }
+  return ft_library_initialized;
+}
+
 static Lisp_Object
 skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 {
@@ -136,11 +169,9 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   struct skia_font_info *skiafont_info;
   struct font *font;
   double size = 0;
-  cairo_font_face_t *font_face;
-  cairo_font_extents_t extents;
-  FT_Face ft_face;
-  FcMatrix *matrix;
   char *filename_str;
+  int font_index = 0;
+  FT_Face ft_face = NULL;
 
   val = assq_no_quit (QCfont_entity, AREF (entity, FONT_EXTRA_INDEX));
   if (!CONSP (val))
@@ -158,65 +189,10 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   FcDefaultSubstitute (pat);
   match = FcFontMatch (NULL, pat, &result);
   ftfont_fix_match (pat, match);
-
   FcPatternDestroy (pat);
-  font_face = cairo_ft_font_face_create_for_pattern (match);
-  if (!font_face
-      || cairo_font_face_status (font_face) != CAIRO_STATUS_SUCCESS)
-    {
-      if (font_face)
-	cairo_font_face_destroy (font_face);
-      FcPatternDestroy (match);
-      unblock_input ();
-      return Qnil;
-    }
 
-  cairo_matrix_t font_matrix, ctm;
-  cairo_matrix_init_scale (&font_matrix, pixel_size, pixel_size);
-  if (FcPatternGetMatrix (match, FC_MATRIX, 0, &matrix)
-      == FcResultMatch)
-    {
-      cairo_matrix_t m;
-      cairo_matrix_init (&m, matrix->xx, matrix->yx, matrix->xy,
-			 matrix->yy, 0, 0);
-      cairo_matrix_multiply (&font_matrix, &m, &font_matrix);
-    }
-  cairo_matrix_init_identity (&ctm);
-
-  cairo_font_options_t *options = cairo_font_options_create ();
-  cairo_font_options_t *gsettings_options
-    = xsettings_get_font_options ();
-  if (gsettings_options)
-    {
-      cairo_font_options_merge (options, gsettings_options);
-      cairo_font_options_destroy (gsettings_options);
-    }
-
-  cairo_scaled_font_t *scaled_font
-    = cairo_scaled_font_create (font_face, &font_matrix, &ctm,
-				options);
-  cairo_font_face_destroy (font_face);
-  cairo_font_options_destroy (options);
-
-  if (!scaled_font
-      || cairo_scaled_font_status (scaled_font)
-	   != CAIRO_STATUS_SUCCESS)
-    {
-      if (scaled_font)
-	cairo_scaled_font_destroy (scaled_font);
-      FcPatternDestroy (match);
-      unblock_input ();
-      return Qnil;
-    }
-
-  ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
-  if (!ft_face)
-    {
-      cairo_scaled_font_destroy (scaled_font);
-      FcPatternDestroy (match);
-      unblock_input ();
-      return Qnil;
-    }
+  /* Get font index from the match.  */
+  FcPatternGetInteger (match, FC_INDEX, 0, &font_index);
 
   font_object = font_build_object (VECSIZE (struct skia_font_info),
 				   Qskia, entity, size);
@@ -232,25 +208,19 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   font->baseline_offset = 0;
   font->relative_compose = 0;
 
-  skiafont_info->base.cr_scaled_font = scaled_font;
   skiafont_info->base.metrics = NULL;
   skiafont_info->base.metrics_nrows = 0;
   skiafont_info->base.bitmap_position_unit = 0;
+  skiafont_info->base.ft_face = NULL;
 
-  /* Create Skia typeface from the font file.  */
+  /* Create Skia typeface and font.  */
   filename_str = SSDATA (filename);
-  fprintf (stderr, "skiafont_open: loading font from %s, size=%g\n",
-	   filename_str, size);
   skiafont_info->skia_typeface
     = emacs_skia_typeface_create_from_file (filename_str);
-  fprintf (stderr, "  skia_typeface=%p\n",
-	   (void *) skiafont_info->skia_typeface);
   if (skiafont_info->skia_typeface)
     {
       skiafont_info->skia_font
 	= emacs_skia_font_create (skiafont_info->skia_typeface, size);
-      fprintf (stderr, "  skia_font=%p\n",
-	       (void *) skiafont_info->skia_font);
       if (skiafont_info->skia_font)
 	{
 	  emacs_skia_font_set_subpixel (skiafont_info->skia_font,
@@ -262,28 +232,55 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   else
     skiafont_info->skia_font = NULL;
 
-  cairo_scaled_font_extents (scaled_font, &extents);
-  font->ascent = lround (extents.ascent);
-  font->descent = lround (extents.descent);
-  font->height = lround (extents.height);
-  font->min_width = font->average_width = font->space_width
-    = lround (extents.max_x_advance);
-
-  /* Get more precise metrics from the FT_Face.  */
-  if (ft_face->face_flags & FT_FACE_FLAG_SCALABLE)
+  /* Get font metrics from Skia.  */
+  if (skiafont_info->skia_font)
     {
-      font->underline_position
-	= -ft_face->underline_position * size / ft_face->units_per_EM;
-      font->underline_thickness
-	= ft_face->underline_thickness * size / ft_face->units_per_EM;
+      emacs_skia_font_extents_t extents;
+      emacs_skia_font_get_extents (skiafont_info->skia_font,
+				   &extents);
+      font->ascent = lround (extents.ascent);
+      font->descent = lround (extents.descent);
+      font->height = lround (extents.height);
+      font->min_width = font->average_width = font->space_width
+	= lround (extents.max_x_advance);
     }
   else
     {
+      /* Fallback to default metrics if Skia font creation failed.  */
+      font->ascent = pixel_size;
+      font->descent = pixel_size / 4;
+      font->height = font->ascent + font->descent;
+      font->min_width = font->average_width = font->space_width
+	= pixel_size / 2;
+    }
+
+  /* Get underline metrics from FreeType directly.  */
+  if (skiafont_init_freetype ()
+      && FT_New_Face (ft_library, filename_str, font_index, &ft_face)
+	   == 0)
+    {
+      if (ft_face->face_flags & FT_FACE_FLAG_SCALABLE)
+	{
+	  font->underline_position = -ft_face->underline_position
+				     * size / ft_face->units_per_EM;
+	  font->underline_thickness = ft_face->underline_thickness
+				      * size / ft_face->units_per_EM;
+	}
+      else
+	{
+	  font->underline_position = -1;
+	  font->underline_thickness = 1;
+	}
+      /* Store ft_face for later use (encode_char, etc.).  */
+      skiafont_info->base.ft_face = ft_face;
+    }
+  else
+    {
+      /* Default underline metrics.  */
       font->underline_position = -1;
       font->underline_thickness = 1;
     }
 
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   FcPatternDestroy (match);
   unblock_input ();
 
@@ -295,6 +292,7 @@ skiafont_close (struct font *font)
 {
   struct skia_font_info *skiafont_info
     = (struct skia_font_info *) font;
+  int i;
 
   if (skiafont_info->skia_font)
     {
@@ -307,23 +305,25 @@ skiafont_close (struct font *font)
       skiafont_info->skia_typeface = NULL;
     }
 
-  if (skiafont_info->base.cr_scaled_font)
-    {
-      int i;
+  block_input ();
 
-      block_input ();
-      cairo_scaled_font_destroy (skiafont_info->base.cr_scaled_font);
-      skiafont_info->base.cr_scaled_font = NULL;
-      if (skiafont_info->base.metrics)
-	{
-	  for (i = 0; i < skiafont_info->base.metrics_nrows; i++)
-	    if (skiafont_info->base.metrics[i])
-	      xfree (skiafont_info->base.metrics[i]);
-	  xfree (skiafont_info->base.metrics);
-	  skiafont_info->base.metrics = NULL;
-	}
-      unblock_input ();
+  /* Close the FreeType face.  */
+  if (skiafont_info->base.ft_face)
+    {
+      FT_Done_Face (skiafont_info->base.ft_face);
+      skiafont_info->base.ft_face = NULL;
     }
+
+  if (skiafont_info->base.metrics)
+    {
+      for (i = 0; i < skiafont_info->base.metrics_nrows; i++)
+	if (skiafont_info->base.metrics[i])
+	  xfree (skiafont_info->base.metrics[i]);
+      xfree (skiafont_info->base.metrics);
+      skiafont_info->base.metrics = NULL;
+    }
+
+  unblock_input ();
 }
 
 static int
@@ -349,12 +349,20 @@ skiafont_has_char (Lisp_Object font, int c)
 static unsigned
 skiafont_encode_char (struct font *font, int c)
 {
-  struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
-  unsigned code = FT_Get_Char_Index (ft_face, c);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
-  return code;
+  struct skia_font_info *skiafont_info
+    = (struct skia_font_info *) font;
+
+  /* Use Skia if available.  */
+  if (skiafont_info->skia_font)
+    return emacs_skia_font_char_to_glyph (skiafont_info->skia_font,
+					  c);
+
+  /* Fall back to FreeType directly.  */
+  struct font_info *ftfont_info = &skiafont_info->base;
+  if (ftfont_info->ft_face)
+    return FT_Get_Char_Index (ftfont_info->ft_face, c);
+
+  return 0;
 }
 
 static void
@@ -411,6 +419,26 @@ skiafont_draw (struct glyph_string *s, int from, int to, int x, int y,
       unblock_input ();
       return 0;
     }
+
+  /* Apply clipping from glyph string to prevent drawing outside
+   * bounds.  */
+  {
+    XRectangle clip_rects[2];
+    int n = get_glyph_string_clip_rects (s, clip_rects, 2);
+    /* Debug: print clip info for rows near bottom (y > 1300) */
+    if (y > 1300 && n > 0)
+      fprintf (stderr, "CLIPDBG: y=%d clip_bottom=%d mode_line=%d\n",
+	       y, clip_rects[0].y + clip_rects[0].height,
+	       s->row ? s->row->mode_line_p : -1);
+    for (int j = 0; j < n; j++)
+      {
+	emacs_skia_irect_t clip
+	  = { clip_rects[j].x, clip_rects[j].y,
+	      clip_rects[j].x + clip_rects[j].width,
+	      clip_rects[j].y + clip_rects[j].height };
+	emacs_skia_canvas_clip_irect (canvas, &clip);
+      }
+  }
 
   emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
 
@@ -475,17 +503,21 @@ skiafont_draw (struct glyph_string *s, int from, int to, int x, int y,
   return len;
 }
 
+/* These functions use the stored FT_Face directly for FreeType
+ * operations.  */
+
 static int
 skiafont_get_bitmap (struct font *font, unsigned int code,
 		     struct font_bitmap *bitmap, int bits_per_pixel)
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return -1;
 
   ftfont_info->ft_size = ft_face->size;
   int result = ftfont_get_bitmap (font, code, bitmap, bits_per_pixel);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 
   return result;
@@ -496,12 +528,13 @@ skiafont_anchor_point (struct font *font, unsigned int code, int idx,
 		       int *x, int *y)
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return -1;
 
   ftfont_info->ft_size = ft_face->size;
   int result = ftfont_anchor_point (font, code, idx, x, y);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 
   return result;
@@ -512,12 +545,13 @@ static Lisp_Object
 skiafont_otf_capability (struct font *font)
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return Qnil;
 
   ftfont_info->ft_size = ft_face->size;
   Lisp_Object result = ftfont_otf_capability (font);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 
   return result;
@@ -531,12 +565,13 @@ skiafont_shape (Lisp_Object lgstring, Lisp_Object direction)
   struct font *font
     = CHECK_FONT_GET_OBJECT (LGSTRING_FONT (lgstring));
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return Qnil;
 
   ftfont_info->ft_size = ft_face->size;
   Lisp_Object result = ftfont_shape (lgstring, direction);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 
   return result;
@@ -550,37 +585,18 @@ skiafont_variation_glyphs (struct font *font, int c,
 			   unsigned variations[256])
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return 0;
 
   ftfont_info->ft_size = ft_face->size;
   int result = ftfont_variation_glyphs (font, c, variations);
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 
   return result;
 }
 # endif
-
-/* Check if a cached font is still valid based on current settings. */
-static bool
-skiafont_cached_font_ok (struct frame *f, Lisp_Object font_object,
-			 Lisp_Object entity)
-{
-  struct font_info *info
-    = (struct font_info *) XFONT_OBJECT (font_object);
-
-  cairo_font_options_t *options = cairo_font_options_create ();
-  cairo_scaled_font_get_font_options (info->cr_scaled_font, options);
-  cairo_font_options_t *gsettings_options
-    = xsettings_get_font_options ();
-
-  bool equal = cairo_font_options_equal (options, gsettings_options);
-  cairo_font_options_destroy (options);
-  cairo_font_options_destroy (gsettings_options);
-
-  return equal;
-}
 
 # ifdef HAVE_HARFBUZZ
 
@@ -600,8 +616,10 @@ static hb_font_t *
 skiahbfont_begin_hb_font (struct font *font, double *position_unit)
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
-  FT_Face ft_face = cairo_ft_scaled_font_lock_face (scaled_font);
+  FT_Face ft_face = ftfont_info->ft_face;
+
+  if (!ft_face)
+    return NULL;
 
   ftfont_info->ft_size = ft_face->size;
   hb_font_t *hb_font = fthbfont_begin_hb_font (font, position_unit);
@@ -616,13 +634,10 @@ static void
 skiahbfont_end_hb_font (struct font *font, hb_font_t *hb_font)
 {
   struct font_info *ftfont_info = (struct font_info *) font;
-  cairo_scaled_font_t *scaled_font = ftfont_info->cr_scaled_font;
 
   eassert (hb_font == ftfont_info->hb_font);
   hb_font_destroy (ftfont_info->hb_font);
   ftfont_info->hb_font = NULL;
-
-  cairo_ft_scaled_font_unlock_face (scaled_font);
   ftfont_info->ft_size = NULL;
 }
 
@@ -656,7 +671,6 @@ struct font_driver const skiafont_driver = {
 # endif
   .filter_properties = ftfont_filter_properties,
   .combining_capability = ftfont_combining_capability,
-  .cached_font_ok = skiafont_cached_font_ok,
 };
 
 # ifdef HAVE_HARFBUZZ

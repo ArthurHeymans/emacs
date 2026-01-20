@@ -29,9 +29,11 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # include FT_BDF_H
 #endif
 
-#if defined(USE_BE_CAIRO) || defined(USE_SKIA)
+#if defined(USE_BE_CAIRO)
 # include <cairo.h>
 #endif
+
+/* USE_SKIA uses pure Skia + FreeType for font rendering.  */
 
 #ifdef HAVE_HARFBUZZ
 # include <hb-ft.h>
@@ -67,13 +69,19 @@ struct font_info
   hb_font_t *hb_font;
 #endif /* HAVE_HARFBUZZ */
 
-#if defined(USE_CAIRO) || defined(USE_BE_CAIRO) || defined(USE_SKIA)
+#if defined(USE_CAIRO) || defined(USE_BE_CAIRO)
   cairo_scaled_font_t *cr_scaled_font;
   /* Scale factor from the bitmap strike metrics in 1/64 pixels, used
      as the hb_position_t value in HarfBuzz, to those in (scaled)
      pixels.  The value is 0 for scalable fonts.  */
   double bitmap_position_unit;
   /* Font metrics cache.  */
+  struct font_metrics **metrics;
+  short metrics_nrows;
+#elif defined(USE_SKIA)
+  /* Pure Skia path: use FreeType directly for FT_Face access.  */
+  FT_Face ft_face; /* Direct FreeType face for metrics.  */
+  double bitmap_position_unit;
   struct font_metrics **metrics;
   short metrics_nrows;
 #else

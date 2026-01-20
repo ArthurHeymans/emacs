@@ -51,7 +51,11 @@ struct pgtk_bitmap_record
   char *file;
   int refcount;
   int height, width, depth;
+# ifdef USE_SKIA
+  emacs_skia_image_t *skia_image;
+# else
   cairo_pattern_t *pattern;
+# endif
 };
 
 struct pgtk_device_t
@@ -431,20 +435,24 @@ struct pgtk_output
      using an external tool bar or if tool bar is horizontal.  */
   int toolbar_left_width, toolbar_right_width;
 
-# if defined(USE_CAIRO) || defined(USE_SKIA)
-  /* Cairo drawing contexts (also used as bridge for Skia).  */
+# ifdef USE_CAIRO
+  /* Cairo drawing contexts.  */
   cairo_t *cr_context, *cr_active;
   int cr_surface_desired_width, cr_surface_desired_height;
-  /* Cairo surface for double buffering */
+  /* Cairo surface for visible bell double buffering */
   cairo_surface_t *cr_surface_visible_bell;
 # endif
 # ifdef USE_SKIA
+  /* Cairo drawing contexts (used as bridge for Skia to GTK).  */
+  cairo_t *cr_context, *cr_active;
+  int cr_surface_desired_width, cr_surface_desired_height;
   /* Skia drawing contexts.  */
   emacs_skia_surface_t *skia_surface;
   emacs_skia_canvas_t *skia_canvas;
   emacs_skia_gl_context_t *skia_gl_context;
   int skia_surface_desired_width, skia_surface_desired_height;
   emacs_skia_paint_t *skia_paint; /* Reusable paint object */
+  emacs_skia_surface_t *skia_surface_visible_bell;
 # endif
   struct atimer *atimer_visible_bell;
 
@@ -693,6 +701,8 @@ extern void pgtk_skia_set_paint_background (struct frame *,
 extern void pgtk_skia_set_paint_color (struct frame *, unsigned long,
 				       bool);
 extern void pgtk_skia_draw_frame (struct frame *);
+extern Lisp_Object pgtk_skia_export_frames (Lisp_Object frames,
+					    Lisp_Object type);
 extern void pgtk_skia_destroy_frame_context (struct frame *);
 # endif
 

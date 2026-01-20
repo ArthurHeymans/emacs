@@ -151,9 +151,10 @@ static void pgtk_skia_clip_to_row (struct window *,
 				   struct glyph_row *,
 				   enum glyph_row_area,
 				   emacs_skia_canvas_t *);
-#endif
+#else
 static void pgtk_clip_to_row (struct window *, struct glyph_row *,
 			      enum glyph_row_area, cairo_t *);
+#endif
 static struct frame *pgtk_any_window_to_frame (GdkWindow *);
 static void pgtk_regenerate_devices (struct pgtk_display_info *);
 
@@ -1407,7 +1408,6 @@ fill_background_by_face (struct frame *f, struct face *face, int x,
 #ifdef USE_SKIA
   if (face->stipple != 0)
     {
-# ifdef SKIA_NO_CAIRO
       /* Full Skia stipple implementation.  */
       emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (f);
       emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
@@ -1424,8 +1424,7 @@ fill_background_by_face (struct frame *f, struct face *face, int x,
       emacs_skia_paint_set_stroke (paint, false);
       emacs_skia_canvas_draw_rect (canvas, &clip, paint);
 
-      /* Draw stipple pattern with foreground color.
-	 Use the Skia bitmap stored alongside the Cairo pattern.  */
+      /* Draw stipple pattern with foreground color.  */
       emacs_skia_image_t *stipple_image
 	= FRAME_DISPLAY_INFO (f)
 	    ->bitmaps[face->stipple - 1]
@@ -1443,33 +1442,6 @@ fill_background_by_face (struct frame *f, struct face *face, int x,
       emacs_skia_paint_set_blend_mode (paint,
 				       EMACS_SKIA_BLEND_SRC_OVER);
       emacs_skia_canvas_restore (canvas);
-# else
-      /* Fall back to Cairo for stipples.  */
-      cairo_t *cr = pgtk_begin_cr_clip (f);
-      double r, g, b, a;
-
-      cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-      cairo_rectangle (cr, x, y, width, height);
-      cairo_clip (cr);
-
-      r = ((face->background >> 16) & 0xff) / 255.0;
-      g = ((face->background >> 8) & 0xff) / 255.0;
-      b = ((face->background >> 0) & 0xff) / 255.0;
-      a = f->alpha_background;
-      cairo_set_source_rgba (cr, r, g, b, a);
-      cairo_paint (cr);
-
-      cairo_pattern_t *mask
-	= FRAME_DISPLAY_INFO (f)->bitmaps[face->stipple - 1].pattern;
-
-      r = ((face->foreground >> 16) & 0xff) / 255.0;
-      g = ((face->foreground >> 8) & 0xff) / 255.0;
-      b = ((face->foreground >> 0) & 0xff) / 255.0;
-      cairo_set_source_rgba (cr, r, g, b, a);
-      cairo_mask (cr, mask);
-
-      pgtk_end_cr_clip (f);
-# endif /* SKIA_NO_CAIRO */
     }
   else
     {
@@ -2083,7 +2055,7 @@ pgtk_skia_set_clip_rectangles (struct frame *f,
 }
 #endif
 
-#ifndef SKIA_NO_CAIRO
+#ifdef USE_CAIRO
 static void
 pgtk_set_clip_rectangles (struct frame *f, cairo_t *cr,
 			  XRectangle *rectangles, int n)
@@ -2552,7 +2524,7 @@ pgtk_skia_draw_image (struct frame *f, Emacs_GC *gc,
 }
 #endif /* USE_SKIA */
 
-#ifndef SKIA_NO_CAIRO
+#ifdef USE_CAIRO
 static void
 pgtk_cr_draw_image (struct frame *f, Emacs_GC *gc,
 		    cairo_pattern_t *image, int src_x, int src_y,
@@ -2589,7 +2561,7 @@ pgtk_cr_draw_image (struct frame *f, Emacs_GC *gc,
 
   pgtk_end_cr_clip (f);
 }
-#endif /* !SKIA_NO_CAIRO */
+#endif /* USE_CAIRO */
 
 /* Draw foreground of image glyph string S.  */
 
@@ -2658,9 +2630,12 @@ pgtk_draw_image_foreground (struct glyph_string *s)
       emacs_skia_canvas_restore (canvas);
     }
   else
-#endif /* USE_SKIA */
-#ifndef SKIA_NO_CAIRO
-    if (s->img->cr_data)
+    /* Draw a rectangle if image could not be loaded.  */
+    pgtk_draw_rectangle (s->f, s->xgcv.foreground, x, y,
+			 s->slice.width - 1, s->slice.height - 1,
+			 false);
+#else  /* USE_CAIRO */
+  if (s->img->cr_data)
     {
       cairo_t *cr = pgtk_begin_cr_clip (s->f);
       pgtk_set_glyph_string_clipping (s, cr);
@@ -2688,11 +2663,11 @@ pgtk_draw_image_foreground (struct glyph_string *s)
       pgtk_end_cr_clip (s->f);
     }
   else
-#endif /* !SKIA_NO_CAIRO */
     /* Draw a rectangle if image could not be loaded.  */
     pgtk_draw_rectangle (s->f, s->xgcv.foreground, x, y,
 			 s->slice.width - 1, s->slice.height - 1,
 			 false);
+#endif /* USE_SKIA */
 }
 
 /* Draw image glyph string S.
@@ -2818,6 +2793,20 @@ pgtk_draw_stretch_glyph_string (struct glyph_string *s)
 	  else
 	    color = s->face->background;
 
+#ifdef USE_SKIA
+	  emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (s->f);
+	  emacs_skia_canvas_save (canvas);
+
+	  get_glyph_string_clip_rect (s, &r);
+	  pgtk_skia_set_clip_rectangles (s->f, canvas, &r, 1);
+
+	  if (s->face->stipple)
+	    fill_background (s, x, y, w, h);
+	  else
+	    pgtk_fill_rectangle (s->f, color, x, y, w, h, true);
+
+	  emacs_skia_canvas_restore (canvas);
+#else
 	  cairo_t *cr = pgtk_begin_cr_clip (s->f);
 
 	  get_glyph_string_clip_rect (s, &r);
@@ -2829,6 +2818,7 @@ pgtk_draw_stretch_glyph_string (struct glyph_string *s)
 	    pgtk_fill_rectangle (s->f, color, x, y, w, h, true);
 
 	  pgtk_end_cr_clip (s->f);
+#endif
 	}
     }
   else if (!s->background_filled_p)
@@ -4165,11 +4155,10 @@ pgtk_mouse_position (struct frame **fp, int insist,
 /* Fringe bitmaps.  */
 
 static int max_fringe_bmp = 0;
-#ifndef SKIA_NO_CAIRO
-static cairo_pattern_t **fringe_bmp = 0;
-#endif
 #ifdef USE_SKIA
 static emacs_skia_image_t **fringe_bmp_skia = 0;
+#else
+static cairo_pattern_t **fringe_bmp = 0;
 #endif
 
 static void
@@ -4182,54 +4171,27 @@ pgtk_define_fringe_bitmap (int which, unsigned short *bits, int h,
     {
       i = max_fringe_bmp;
       max_fringe_bmp = which + 20;
-#ifndef SKIA_NO_CAIRO
-      fringe_bmp
-	= xrealloc (fringe_bmp,
-		    max_fringe_bmp * sizeof (cairo_pattern_t *));
-#endif
 #ifdef USE_SKIA
       fringe_bmp_skia
 	= xrealloc (fringe_bmp_skia,
 		    max_fringe_bmp * sizeof (emacs_skia_image_t *));
+#else
+      fringe_bmp
+	= xrealloc (fringe_bmp,
+		    max_fringe_bmp * sizeof (cairo_pattern_t *));
 #endif
       while (i < max_fringe_bmp)
 	{
-#ifndef SKIA_NO_CAIRO
-	  fringe_bmp[i] = 0;
-#endif
 #ifdef USE_SKIA
 	  fringe_bmp_skia[i] = 0;
+#else
+	  fringe_bmp[i] = 0;
 #endif
 	  i++;
 	}
     }
 
   block_input ();
-
-#ifndef SKIA_NO_CAIRO
-  {
-    int stride;
-    cairo_surface_t *surface;
-    unsigned char *data;
-    cairo_pattern_t *pattern;
-
-    surface = cairo_image_surface_create (CAIRO_FORMAT_A1, wd, h);
-    stride = cairo_image_surface_get_stride (surface);
-    data = cairo_image_surface_get_data (surface);
-
-    for (i = 0; i < h; i++)
-      {
-	*((unsigned short *) data) = bits[i];
-	data += stride;
-      }
-
-    cairo_surface_mark_dirty (surface);
-    pattern = cairo_pattern_create_for_surface (surface);
-    cairo_surface_destroy (surface);
-
-    fringe_bmp[which] = pattern;
-  }
-#endif
 
 #ifdef USE_SKIA
   {
@@ -4256,6 +4218,29 @@ pgtk_define_fringe_bitmap (int which, unsigned short *bits, int h,
 					     stride);
     xfree (bitmap_data);
   }
+#else /* USE_CAIRO */
+  {
+    int stride;
+    cairo_surface_t *surface;
+    unsigned char *data;
+    cairo_pattern_t *pattern;
+
+    surface = cairo_image_surface_create (CAIRO_FORMAT_A1, wd, h);
+    stride = cairo_image_surface_get_stride (surface);
+    data = cairo_image_surface_get_data (surface);
+
+    for (i = 0; i < h; i++)
+      {
+	*((unsigned short *) data) = bits[i];
+	data += stride;
+      }
+
+    cairo_surface_mark_dirty (surface);
+    pattern = cairo_pattern_create_for_surface (surface);
+    cairo_surface_destroy (surface);
+
+    fringe_bmp[which] = pattern;
+  }
 #endif
 
   unblock_input ();
@@ -4269,7 +4254,13 @@ pgtk_destroy_fringe_bitmap (int which)
 
   block_input ();
 
-#ifndef SKIA_NO_CAIRO
+#ifdef USE_SKIA
+  if (fringe_bmp_skia[which])
+    {
+      emacs_skia_image_destroy (fringe_bmp_skia[which]);
+      fringe_bmp_skia[which] = 0;
+    }
+#else
   if (fringe_bmp[which])
     {
       cairo_pattern_destroy (fringe_bmp[which]);
@@ -4277,18 +4268,10 @@ pgtk_destroy_fringe_bitmap (int which)
     }
 #endif
 
-#ifdef USE_SKIA
-  if (fringe_bmp_skia[which])
-    {
-      emacs_skia_image_destroy (fringe_bmp_skia[which]);
-      fringe_bmp_skia[which] = 0;
-    }
-#endif
-
   unblock_input ();
 }
 
-#ifndef SKIA_NO_CAIRO
+#ifdef USE_CAIRO
 static void
 pgtk_clip_to_row (struct window *w, struct glyph_row *row,
 		  enum glyph_row_area area, cairo_t *cr)
@@ -8540,27 +8523,6 @@ pgtk_end_skia_clip (struct frame *f)
   emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (f);
   if (canvas)
     emacs_skia_canvas_restore (canvas);
-}
-
-/* Skia version of pgtk_clip_to_row.  */
-static void
-pgtk_skia_clip_to_row (struct window *w, struct glyph_row *row,
-		       enum glyph_row_area area,
-		       emacs_skia_canvas_t *canvas)
-{
-  int window_x, window_y, window_width;
-
-  window_box (w, area, &window_x, &window_y, &window_width, 0);
-
-  int rect_x = window_x;
-  int rect_y = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
-  rect_y = max (rect_y, window_y);
-  int rect_width = window_width;
-  int rect_height = row->visible_height;
-
-  emacs_skia_irect_t clip_rect
-    = { rect_x, rect_y, rect_x + rect_width, rect_y + rect_height };
-  emacs_skia_canvas_clip_irect (canvas, &clip_rect);
 }
 
 void
