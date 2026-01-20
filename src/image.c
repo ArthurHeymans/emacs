@@ -3212,8 +3212,8 @@ image_set_transform (struct frame *f, struct image *img)
   /* Determine flipping.  */
   flip = !NILP (image_spec_value (img->spec, QCflip, NULL));
 
-# if defined USE_CAIRO || defined HAVE_XRENDER || defined HAVE_NS \
-   || defined HAVE_HAIKU || defined HAVE_ANDROID                  \
+# if defined USE_CAIRO || defined USE_SKIA || defined HAVE_XRENDER  \
+   || defined HAVE_NS || defined HAVE_HAIKU || defined HAVE_ANDROID \
    || defined HAVE_NTGUI
   /* We want scale up operations to use a nearest neighbor filter to
      show real pixels instead of munging them, but scale down
@@ -3239,7 +3239,8 @@ image_set_transform (struct frame *f, struct image *img)
   /* Perform scale transformation.  */
 
   matrix3x3 matrix = {
-# if defined USE_CAIRO || defined HAVE_XRENDER || defined HAVE_ANDROID
+# if defined USE_CAIRO || defined USE_SKIA || defined HAVE_XRENDER \
+   || defined HAVE_ANDROID
     [0][0] = (!IEEE_FLOATING_POINT && width == 0
 		? DBL_MAX
 		: img->width / (double) width),
@@ -3280,8 +3281,8 @@ image_set_transform (struct frame *f, struct image *img)
   else
     {
 # ifndef HAVE_ANDROID
-#  if (defined USE_CAIRO || defined HAVE_XRENDER \
-       || defined HAVE_NTGUI || defined HAVE_NS  \
+#  if (defined USE_CAIRO || defined USE_SKIA || defined HAVE_XRENDER \
+       || defined HAVE_NTGUI || defined HAVE_NS                      \
        || defined HAVE_HAIKU)
       int cos_r, sin_r;
       if (rotation == 0)
@@ -3344,7 +3345,7 @@ image_set_transform (struct frame *f, struct image *img)
 
       if (0 < rotate_flag)
 	{
-#   if defined USE_CAIRO || defined HAVE_XRENDER \
+#   if defined USE_CAIRO || defined USE_SKIA || defined HAVE_XRENDER \
      || defined HAVE_ANDROID
 	  /* 1. Translate so (0, 0) is in the center of the image.  */
 	  matrix3x3 t = { [0][0] = 1,
@@ -4351,11 +4352,12 @@ image_destroy_x_image (Emacs_Pix_Container pimg)
   eassert (input_blocked_p ());
   if (pimg)
     {
-# if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+# if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU \
+   || defined HAVE_NS
       /* On these systems, Emacs_Pix_Containers always point to the
 	 same data as pixmaps in `struct image', and therefore must
 	 never be freed separately.  */
-# endif /* USE_CAIRO || HAVE_HAIKU || HAVE_NS */
+# endif /* USE_CAIRO || USE_SKIA || HAVE_HAIKU || HAVE_NS */
 # ifdef HAVE_NTGUI
       /* Data will be freed by DestroyObject.  */
       pimg->data = NULL;
@@ -4373,7 +4375,8 @@ static void
 gui_put_x_image (struct frame *f, Emacs_Pix_Container pimg,
 		 Emacs_Pixmap pixmap, int width, int height)
 {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+#if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU \
+  || defined HAVE_NS
   eassert (pimg == pixmap);
 #elif defined HAVE_X_WINDOWS
   GC gc;
@@ -7050,8 +7053,8 @@ lookup_rgb_color (struct frame *f, int r, int g, int b)
 {
 # ifdef HAVE_NTGUI
   return PALETTERGB (r >> 8, g >> 8, b >> 8);
-# elif defined USE_CAIRO || defined HAVE_NS || defined HAVE_HAIKU \
-   || defined HAVE_ANDROID
+# elif defined USE_CAIRO || defined USE_SKIA || defined HAVE_NS \
+   || defined HAVE_HAIKU || defined HAVE_ANDROID
   return RGB_TO_ULONG (r >> 8, g >> 8, b >> 8);
 # else
   xsignal1 (Qfile_error,
