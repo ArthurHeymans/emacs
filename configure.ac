@@ -553,6 +553,7 @@ OPTION_DEFAULT_ON([lcms2],[don't compile with Little CMS support])
 OPTION_DEFAULT_ON([libsystemd],[don't compile with libsystemd support])
 OPTION_DEFAULT_ON([cairo],[don't compile with Cairo drawing])
 OPTION_DEFAULT_OFF([cairo-xcb], [use XCB surfaces for Cairo support])
+OPTION_DEFAULT_OFF([skia],[use Skia for GPU-accelerated drawing (experimental)])
 OPTION_DEFAULT_ON([xml2],[don't compile with XML parsing support])
 OPTION_DEFAULT_OFF([imagemagick],[compile with ImageMagick image support])
 OPTION_DEFAULT_ON([native-image-api], [don't use native image APIs (GDI+ on Windows)])
@@ -4509,20 +4510,111 @@ if test "$with_xwidgets" != "no"; then
 fi
 AC_SUBST([XWIDGETS_OBJ])
 
-if test "$window_system" = "pgtk"; then
-  CAIRO_REQUIRED=1.12.0
-  CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
-  EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
-  if test $HAVE_CAIRO = yes; then
-    AC_DEFINE([USE_CAIRO], [1], [Define to 1 if using cairo.])
+dnl Skia support (experimental, for PGTK)
+HAVE_SKIA=no
+if test "${with_skia}" = "yes"; then
+  dnl Check for Skia library
+  AC_MSG_CHECKING([for Skia])
+
+  dnl Allow user to specify paths via environment variables
+  AC_ARG_VAR([SKIA_DIR], [Path to Skia source/installation])
+  AC_ARG_VAR([SKIA_CFLAGS], [C compiler flags for Skia])
+  AC_ARG_VAR([SKIA_LIBS], [linker flags for Skia])
+
+  dnl First check if SKIA_CFLAGS and SKIA_LIBS are already set (e.g., from Nix)
+  if test -n "$SKIA_CFLAGS" && test -n "$SKIA_LIBS"; then
+    HAVE_SKIA=yes
   else
-    AC_MSG_ERROR([cairo required but not found.])
+    dnl Try pkg-config
+    PKG_CHECK_EXISTS([skia], [
+      PKG_CHECK_MODULES([SKIA], [skia], [HAVE_SKIA=yes], [HAVE_SKIA=no])
+    ], [
+      dnl Manual detection - check for header file existence
+      if test -n "$SKIA_DIR"; then
+        dnl Check for Nix-style layout (include/skia/core/SkCanvas.h)
+        if test -f "$SKIA_DIR/include/skia/core/SkCanvas.h"; then
+          HAVE_SKIA=yes
+          SKIA_CFLAGS="-I$SKIA_DIR/include/skia"
+          if test -f "$SKIA_DIR/lib/libskia.so"; then
+            SKIA_LIBS="-L$SKIA_DIR/lib -lskia"
+          else
+            SKIA_LIBS="-lskia"
+          fi
+        dnl Check for source-build layout (include/core/SkCanvas.h)
+        elif test -f "$SKIA_DIR/include/core/SkCanvas.h"; then
+          HAVE_SKIA=yes
+          SKIA_CFLAGS="-I$SKIA_DIR"
+          if test -f "$SKIA_DIR/out/Release/libskia.a"; then
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+          elif test -f "$SKIA_DIR/out/Release/libskia.so"; then
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+          else
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+            AC_MSG_WARN([Skia library not found at $SKIA_DIR/out/Release - you need to build Skia first])
+          fi
+        else
+          HAVE_SKIA=no
+        fi
+      else
+        dnl Try system paths
+        save_CPPFLAGS="$CPPFLAGS"
+        AC_CHECK_HEADER([skia/core/SkCanvas.h], [
+          HAVE_SKIA=yes
+          SKIA_CFLAGS=""
+          SKIA_LIBS="-lskia"
+        ], [HAVE_SKIA=no])
+        CPPFLAGS="$save_CPPFLAGS"
+      fi
+    ])
   fi
 
-  CFLAGS="$CFLAGS $CAIRO_CFLAGS"
-  LIBS="$LIBS $CAIRO_LIBS"
-  AC_SUBST([CAIRO_CFLAGS])
-  AC_SUBST([CAIRO_LIBS])
+  if test "$HAVE_SKIA" = "yes"; then
+    AC_DEFINE([USE_SKIA], [1], [Define to 1 if using Skia for drawing.])
+    CFLAGS="$CFLAGS $SKIA_CFLAGS"
+    CXXFLAGS="$CXXFLAGS $SKIA_CFLAGS"
+    dnl Ensure we link with C++ standard library
+    case "$SKIA_LIBS" in
+      *-lstdc++*) ;;
+      *) SKIA_LIBS="$SKIA_LIBS -lstdc++" ;;
+    esac
+    AC_SUBST([SKIA_CFLAGS])
+    AC_SUBST([SKIA_LIBS])
+    AC_MSG_RESULT([yes])
+  else
+    AC_MSG_RESULT([no])
+    AC_MSG_WARN([Skia requested but not found. Install Skia or set SKIA_DIR/SKIA_CFLAGS/SKIA_LIBS.])
+  fi
+fi
+AC_SUBST([HAVE_SKIA])
+
+dnl Skia C++ objects (must come after HAVE_SKIA is set)
+SKIA_CXX_OBJ=
+if test "$HAVE_SKIA" = "yes"; then
+  SKIA_CXX_OBJ="skia/emacs_skia.o"
+fi
+AC_SUBST([SKIA_CXX_OBJ])
+
+if test "$window_system" = "pgtk"; then
+  dnl For PGTK, either Cairo or Skia is required
+  if test "$HAVE_SKIA" = "yes"; then
+    dnl Using Skia for PGTK
+    AC_MSG_NOTICE([Using Skia for PGTK rendering])
+  else
+    dnl Fall back to Cairo
+    CAIRO_REQUIRED=1.12.0
+    CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
+    EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
+    if test $HAVE_CAIRO = yes; then
+      AC_DEFINE([USE_CAIRO], [1], [Define to 1 if using cairo.])
+    else
+      AC_MSG_ERROR([Either cairo or skia required for PGTK but neither found.])
+    fi
+
+    CFLAGS="$CFLAGS $CAIRO_CFLAGS"
+    LIBS="$LIBS $CAIRO_LIBS"
+    AC_SUBST([CAIRO_CFLAGS])
+    AC_SUBST([CAIRO_LIBS])
+  fi
 fi
 
 if test "${HAVE_BE_APP}" = "yes"; then
@@ -4641,6 +4733,10 @@ if test "${HAVE_X11}" = "yes"; then
   if test "${HAVE_FREETYPE}" = "yes"; then
     AC_DEFINE([HAVE_FREETYPE], [1],
 	      [Define to 1 if using the freetype and fontconfig libraries.])
+    if test "${HAVE_FONTCONFIG}" = "yes"; then
+      AC_DEFINE([HAVE_FONTCONFIG], [1],
+		[Define to 1 if using the fontconfig library.])
+    fi
     OLD_CFLAGS=$CFLAGS
     OLD_LIBS=$LIBS
     CFLAGS="$CFLAGS $FREETYPE_CFLAGS"
@@ -4688,6 +4784,8 @@ else # "${HAVE_X11}" != "yes"
     HAVE_LIBOTF=no
     AC_DEFINE([HAVE_FREETYPE], [1],
 	      [Define to 1 if using the freetype and fontconfig libraries.])
+    AC_DEFINE([HAVE_FONTCONFIG], [1],
+	      [Define to 1 if using the fontconfig library.])
     if test "${with_libotf}" != "no"; then
       EMACS_CHECK_MODULES([LIBOTF], [libotf])
       if test "$HAVE_LIBOTF" = "yes"; then
@@ -7219,7 +7317,9 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
   XMENU_OBJ=xmenu.o
   XOBJ="xterm.o xfns.o xselect.o xrdb.o xsmfns.o xsettings.o"
   FONT_OBJ=xfont.o
-  if test "$HAVE_CAIRO" = "yes"; then
+  if test "$HAVE_SKIA" = "yes"; then
+    FONT_OBJ="$FONT_OBJ ftfont.o skiafont.o"
+  elif test "$HAVE_CAIRO" = "yes"; then
     FONT_OBJ="$FONT_OBJ ftfont.o ftcrfont.o"
   elif test "$HAVE_XFT" = "yes"; then
     FONT_OBJ="$FONT_OBJ ftfont.o xftfont.o"
@@ -7229,7 +7329,11 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
 fi
 
 if test "${window_system}" = "pgtk"; then
-   FONT_OBJ="ftfont.o ftcrfont.o"
+   if test "${HAVE_SKIA}" = "yes"; then
+     FONT_OBJ="ftfont.o skiafont.o"
+   else
+     FONT_OBJ="ftfont.o ftcrfont.o"
+   fi
 fi
 
 if test "${HAVE_BE_APP}" = "yes" ; then
