@@ -167,6 +167,13 @@ extern "C"
   int emacs_skia_surface_get_width (emacs_skia_surface_t *surface);
   int emacs_skia_surface_get_height (emacs_skia_surface_t *surface);
 
+  /* Make an image snapshot from the surface (for scrolling/copying)
+   */
+  emacs_skia_image_t *emacs_skia_surface_make_image_snapshot (
+    emacs_skia_surface_t *surface);
+  emacs_skia_image_t *emacs_skia_surface_make_image_snapshot_rect (
+    emacs_skia_surface_t *surface, const emacs_skia_irect_t *rect);
+
   /* ============================================================
      Canvas (drawing context)
      ============================================================ */

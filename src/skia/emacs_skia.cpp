@@ -441,6 +441,40 @@ emacs_skia_surface_get_height (emacs_skia_surface_t *surface)
   return surface ? surface->surface->height () : 0;
 }
 
+emacs_skia_image_t *
+emacs_skia_surface_make_image_snapshot (emacs_skia_surface_t *surface)
+{
+  if (!surface || !surface->surface)
+    return nullptr;
+
+  sk_sp<SkImage> image = surface->surface->makeImageSnapshot ();
+  if (!image)
+    return nullptr;
+
+  auto *result = new emacs_skia_image_t;
+  result->image = image;
+  return result;
+}
+
+emacs_skia_image_t *
+emacs_skia_surface_make_image_snapshot_rect (
+  emacs_skia_surface_t *surface, const emacs_skia_irect_t *rect)
+{
+  if (!surface || !surface->surface || !rect)
+    return nullptr;
+
+  SkIRect sk_rect = SkIRect::MakeLTRB (rect->left, rect->top,
+				       rect->right, rect->bottom);
+  sk_sp<SkImage> image
+    = surface->surface->makeImageSnapshot (sk_rect);
+  if (!image)
+    return nullptr;
+
+  auto *result = new emacs_skia_image_t;
+  result->image = image;
+  return result;
+}
+
 /* ============================================================
    Canvas
    ============================================================ */

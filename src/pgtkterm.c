@@ -3291,6 +3291,41 @@ static void
 pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 		cairo_rectangle_t *dst_rect)
 {
+#ifdef USE_SKIA
+  /* Skia version: snapshot the source region and draw to destination.
+   */
+  emacs_skia_surface_t *skia_surface = FRAME_SKIA_SURFACE (f);
+  if (skia_surface)
+    {
+      emacs_skia_irect_t src_irect
+	= { (int) src_rect->x, (int) src_rect->y,
+	    (int) (src_rect->x + src_rect->width),
+	    (int) (src_rect->y + src_rect->height) };
+
+      emacs_skia_image_t *snapshot
+	= emacs_skia_surface_make_image_snapshot_rect (skia_surface,
+						       &src_irect);
+      if (snapshot)
+	{
+	  emacs_skia_canvas_t *canvas = pgtk_begin_skia_clip (f);
+	  emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
+
+	  /* Set up paint for direct copy (SRC blend mode).  */
+	  emacs_skia_paint_set_blend_mode (paint,
+					   EMACS_SKIA_BLEND_SRC);
+
+	  /* Draw the snapshot at the destination position.  */
+	  emacs_skia_canvas_draw_image (canvas, snapshot,
+					(float) dst_rect->x,
+					(float) dst_rect->y, paint);
+
+	  pgtk_end_skia_clip (f);
+	  emacs_skia_image_destroy (snapshot);
+	}
+      return;
+    }
+#endif
+
   cairo_t *cr;
   cairo_surface_t *surface; /* temporary surface */
 
