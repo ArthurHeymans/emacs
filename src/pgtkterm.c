@@ -131,6 +131,10 @@ static void pgtk_skia_fill_rectangle (struct frame *, unsigned long,
 				      int, int, int, int, bool);
 static void pgtk_skia_draw_rectangle (struct frame *, unsigned long,
 				      int, int, int, int, bool);
+static void pgtk_skia_clip_to_row (struct window *,
+				   struct glyph_row *,
+				   enum glyph_row_area,
+				   emacs_skia_canvas_t *);
 #endif
 static void pgtk_clip_to_row (struct window *, struct glyph_row *,
 			      enum glyph_row_area, cairo_t *);
@@ -2999,13 +3003,6 @@ pgtk_draw_hollow_cursor (struct window *w, struct glyph_row *row)
   get_phys_cursor_geometry (w, row, cursor_glyph, &x, &y, &h);
   wd = w->phys_cursor_width - 1;
 
-  /* The foreground of cursor_gc is typically the same as the normal
-     background color, which can cause the cursor box to be invisible.
-   */
-  cairo_t *cr = pgtk_begin_cr_clip (f);
-  pgtk_set_cr_source_with_color (f, FRAME_X_OUTPUT (f)->cursor_color,
-				 false);
-
   /* When on R2L character, show cursor at the right edge of the
      glyph, unless the cursor box is as wide as the glyph or wider
      (the latter happens when x-stretch-cursor is non-nil).  */
@@ -3016,11 +3013,40 @@ pgtk_draw_hollow_cursor (struct window *w, struct glyph_row *row)
       if (wd > 0)
 	wd -= 1;
     }
+
+#ifdef USE_SKIA
+  /* Use Skia directly with Skia clipping.  */
+  emacs_skia_canvas_t *canvas = pgtk_begin_skia_clip (f);
+  if (canvas)
+    {
+      pgtk_skia_clip_to_row (w, row, TEXT_AREA, canvas);
+      pgtk_skia_set_paint_color (f, FRAME_X_OUTPUT (f)->cursor_color,
+				 false);
+
+      emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
+      emacs_skia_paint_set_stroke (paint, true);
+      emacs_skia_paint_set_stroke_width (paint, 1.0f);
+
+      emacs_skia_rect_t rect
+	= { x + 0.5f, y + 0.5f, x + wd + 0.5f, y + h - 1 + 0.5f };
+      emacs_skia_canvas_draw_rect (canvas, &rect, paint);
+
+      emacs_skia_paint_set_stroke (paint, false);
+      pgtk_end_skia_clip (f);
+    }
+#else
+  /* The foreground of cursor_gc is typically the same as the normal
+     background color, which can cause the cursor box to be invisible.
+   */
+  cairo_t *cr = pgtk_begin_cr_clip (f);
+  pgtk_set_cr_source_with_color (f, FRAME_X_OUTPUT (f)->cursor_color,
+				 false);
   /* Set clipping, draw the rectangle, and reset clipping again.  */
   pgtk_clip_to_row (w, row, TEXT_AREA, cr);
   pgtk_draw_rectangle (f, FRAME_X_OUTPUT (f)->cursor_color, x, y, wd,
 		       h - 1, false);
   pgtk_end_cr_clip (f);
+#endif
 }
 
 /* Draw a bar cursor on window W in glyph row ROW.
@@ -3062,8 +3088,6 @@ pgtk_draw_bar_cursor (struct window *w, struct glyph_row *row,
       struct face *face = FACE_FROM_ID (f, cursor_glyph->face_id);
       unsigned long color;
 
-      cairo_t *cr = pgtk_begin_cr_clip (f);
-
       /* If the glyph's background equals the color we normally draw
 	 the bars cursor in, the bar cursor in its normal color is
 	 invisible.  Use the glyph's foreground color instead in this
@@ -3073,6 +3097,72 @@ pgtk_draw_bar_cursor (struct window *w, struct glyph_row *row,
 	color = face->foreground;
       else
 	color = FRAME_X_OUTPUT (f)->cursor_color;
+
+#ifdef USE_SKIA
+      emacs_skia_canvas_t *canvas = pgtk_begin_skia_clip (f);
+      if (canvas)
+	{
+	  pgtk_skia_clip_to_row (w, row, TEXT_AREA, canvas);
+	  pgtk_skia_set_paint_color (f, color, false);
+
+	  if (kind == BAR_CURSOR)
+	    {
+	      int x
+		= WINDOW_TEXT_TO_FRAME_PIXEL_X (w, w->phys_cursor.x);
+
+	      if (width < 0)
+		width = FRAME_CURSOR_WIDTH (f);
+	      width = min (cursor_glyph->pixel_width, width);
+
+	      w->phys_cursor_width = width;
+
+	      /* If the character under cursor is R2L, draw the bar
+		 cursor on the right of its glyph, rather than on the
+		 left.  */
+	      if ((cursor_glyph->resolved_level & 1) != 0)
+		x += cursor_glyph->pixel_width - width;
+
+	      emacs_skia_irect_t rect
+		= { x, WINDOW_TO_FRAME_PIXEL_Y (w, w->phys_cursor.y),
+		    x + width,
+		    WINDOW_TO_FRAME_PIXEL_Y (w, w->phys_cursor.y)
+		      + row->height };
+	      emacs_skia_canvas_draw_irect (canvas, &rect,
+					    FRAME_SKIA_PAINT (f));
+	    }
+	  else /* HBAR_CURSOR */
+	    {
+	      int dummy_x, dummy_y, dummy_h;
+	      int x
+		= WINDOW_TEXT_TO_FRAME_PIXEL_X (w, w->phys_cursor.x);
+
+	      if (width < 0)
+		width = row->height;
+
+	      width = min (row->height, width);
+
+	      get_phys_cursor_geometry (w, row, cursor_glyph,
+					&dummy_x, &dummy_y, &dummy_h);
+
+	      if ((cursor_glyph->resolved_level & 1) != 0
+		  && cursor_glyph->pixel_width
+		       > w->phys_cursor_width - 1)
+		x += cursor_glyph->pixel_width - w->phys_cursor_width
+		     + 1;
+
+	      int y = WINDOW_TO_FRAME_PIXEL_Y (w, w->phys_cursor.y
+						    + row->height
+						    - width);
+	      emacs_skia_irect_t rect
+		= { x, y, x + w->phys_cursor_width - 1, y + width };
+	      emacs_skia_canvas_draw_irect (canvas, &rect,
+					    FRAME_SKIA_PAINT (f));
+	    }
+
+	  pgtk_end_skia_clip (f);
+	}
+#else
+      cairo_t *cr = pgtk_begin_cr_clip (f);
 
       pgtk_clip_to_row (w, row, TEXT_AREA, cr);
 
@@ -3125,6 +3215,7 @@ pgtk_draw_bar_cursor (struct window *w, struct glyph_row *row,
 	}
 
       pgtk_end_cr_clip (f);
+#endif
     }
 }
 
@@ -7820,6 +7911,27 @@ pgtk_end_skia_clip (struct frame *f)
   emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (f);
   if (canvas)
     emacs_skia_canvas_restore (canvas);
+}
+
+/* Skia version of pgtk_clip_to_row.  */
+static void
+pgtk_skia_clip_to_row (struct window *w, struct glyph_row *row,
+		       enum glyph_row_area area,
+		       emacs_skia_canvas_t *canvas)
+{
+  int window_x, window_y, window_width;
+
+  window_box (w, area, &window_x, &window_y, &window_width, 0);
+
+  int rect_x = window_x;
+  int rect_y = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
+  rect_y = max (rect_y, window_y);
+  int rect_width = window_width;
+  int rect_height = row->visible_height;
+
+  emacs_skia_irect_t clip_rect
+    = { rect_x, rect_y, rect_x + rect_width, rect_y + rect_height };
+  emacs_skia_canvas_clip_irect (canvas, &clip_rect);
 }
 
 void
