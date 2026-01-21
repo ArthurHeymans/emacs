@@ -144,6 +144,16 @@ extern "C"
   void emacs_skia_cleanup (void);
 
   /* ============================================================
+     Capability Queries
+     ============================================================ */
+
+  /* Query whether specific Skia features are available.
+     These functions return true if the feature was compiled in.  */
+  bool emacs_skia_has_gl_support (void);
+  bool emacs_skia_has_pdf_support (void);
+  bool emacs_skia_has_svg_support (void);
+
+  /* ============================================================
      GL Context (for GPU-accelerated rendering)
      ============================================================ */
 

@@ -73,11 +73,19 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # include "gpu/ganesh/gl/GrGLInterface.h"
 /* GL types for fence sync - use epoxy for portable GL loading.  */
 # include <epoxy/gl.h>
+/* For dlsym fallback when getting GL proc addresses.  */
+# include <dlfcn.h>
 #endif
 
 /* ============================================================
    Internal type wrappers
    ============================================================ */
+
+/* Canvas wrapper must be defined before surface so it can be embedded.  */
+struct emacs_skia_canvas
+{
+  SkCanvas *canvas; /* Borrowed pointer, owned by surface/document */
+};
 
 struct emacs_skia_surface
 {
@@ -86,11 +94,10 @@ struct emacs_skia_surface
 #ifdef SK_GL
   GrDirectContext *context; /* For GPU surfaces, to flush */
 #endif
-};
-
-struct emacs_skia_canvas
-{
-  SkCanvas *canvas; /* Borrowed pointer, owned by surface */
+  /* Per-surface canvas wrapper to avoid thread-safety issues with
+     static variables.  The wrapper holds a borrowed pointer to the
+     SkCanvas owned by the surface.  */
+  emacs_skia_canvas canvas_wrapper;
 };
 
 struct emacs_skia_paint
@@ -129,6 +136,19 @@ struct emacs_skia_gl_context
 {
   int dummy;
 };
+#endif
+
+/* ============================================================
+   Constants
+   ============================================================ */
+
+/* GL surface configuration.  */
+#ifdef SK_GL
+/* Number of MSAA samples for GL surfaces.  0 = no multisampling.  */
+constexpr int GL_SURFACE_MSAA_SAMPLES = 0;
+/* Number of stencil buffer bits.  Skia needs stencil for clip mask
+   operations.  8 bits is standard and widely supported.  */
+constexpr int GL_SURFACE_STENCIL_BITS = 8;
 #endif
 
 /* ============================================================
@@ -253,11 +273,55 @@ emacs_skia_init (void)
   (void) get_font_mgr ();
 }
 
+/* Forward declaration for SVG cleanup.  */
+#ifdef SK_SVG
+static void cleanup_svg_canvas_map (void);
+#endif
+
 void
 emacs_skia_cleanup (void)
 {
+#ifdef SK_SVG
+  /* Clean up any leaked SVG canvases.  */
+  cleanup_svg_canvas_map ();
+#endif
+
   /* Release global font manager */
   global_font_mgr.reset ();
+}
+
+/* ============================================================
+   Capability Queries
+   ============================================================ */
+
+bool
+emacs_skia_has_gl_support (void)
+{
+#ifdef SK_GL
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool
+emacs_skia_has_pdf_support (void)
+{
+#ifdef SK_PDF
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool
+emacs_skia_has_svg_support (void)
+{
+#ifdef SK_SVG
+  return true;
+#else
+  return false;
+#endif
 }
 
 /* ============================================================
@@ -266,12 +330,12 @@ emacs_skia_cleanup (void)
 
 /* Create GL context using the native GL interface.  This uses the
    currently active GL context (e.g., set by GDK).  */
-/* Callback for GrGLMakeAssembledInterface to get GL function
-   pointers. We use dlsym on libGL.so which works for both GLX and EGL
-   contexts when the context is already current.  */
-#ifdef SK_GL
-# include <dlfcn.h>
 
+#ifdef SK_GL
+/* GL proc loader using dlsym.  This works for both GLX and EGL contexts
+   when the context is already current.  libepoxy is used for GL types
+   and function declarations, but we use dlsym for proc address lookup
+   for maximum compatibility.  */
 static void *gl_lib_handle = nullptr;
 
 static GrGLFuncPtr
@@ -279,21 +343,16 @@ get_gl_proc (void *ctx, const char *name)
 {
   (void) ctx;
 
-  /* Lazy-load libGL.so */
+  /* Lazy-load GL library.  Try libGL first (desktop), then GLES (mobile/Wayland).  */
   if (!gl_lib_handle)
     {
       gl_lib_handle = dlopen ("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
       if (!gl_lib_handle)
 	gl_lib_handle = dlopen ("libGL.so", RTLD_LAZY | RTLD_GLOBAL);
       if (!gl_lib_handle)
-	{
-	  /* Try EGL/GLES for Wayland */
-	  gl_lib_handle
-	    = dlopen ("libGLESv2.so.2", RTLD_LAZY | RTLD_GLOBAL);
-	  if (!gl_lib_handle)
-	    gl_lib_handle
-	      = dlopen ("libGLESv2.so", RTLD_LAZY | RTLD_GLOBAL);
-	}
+	gl_lib_handle = dlopen ("libGLESv2.so.2", RTLD_LAZY | RTLD_GLOBAL);
+      if (!gl_lib_handle)
+	gl_lib_handle = dlopen ("libGLESv2.so", RTLD_LAZY | RTLD_GLOBAL);
     }
 
   if (!gl_lib_handle)
@@ -307,15 +366,22 @@ emacs_skia_gl_context_t *
 emacs_skia_gl_context_create_native (void)
 {
 #ifdef SK_GL
-  /* Use GrGLMakeAssembledInterface with our dlsym-based function
-   * loader.  */
+  /* Use GrGLMakeAssembledInterface with libepoxy's function loader.  */
   auto interface = GrGLMakeAssembledInterface (nullptr, get_gl_proc);
   if (!interface)
-    return nullptr;
+    {
+      fprintf (stderr, "Skia: Failed to create GL interface "
+	       "(is GL context current?)\n");
+      return nullptr;
+    }
 
   auto grContext = GrDirectContexts::MakeGL (interface);
   if (!grContext)
-    return nullptr;
+    {
+      fprintf (stderr, "Skia: Failed to create GrDirectContext "
+	       "(GL version may be too old)\n");
+      return nullptr;
+    }
 
   auto result = new emacs_skia_gl_context_t;
   result->context = grContext;
@@ -333,11 +399,17 @@ emacs_skia_gl_context_create (emacs_skia_gl_get_proc_fn get_proc,
   auto interface = GrGLMakeAssembledInterface (ctx, (GrGLGetProc)
 						      get_proc);
   if (!interface)
-    return nullptr;
+    {
+      fprintf (stderr, "Skia: Failed to assemble GL interface\n");
+      return nullptr;
+    }
 
   auto grContext = GrDirectContexts::MakeGL (interface);
   if (!grContext)
-    return nullptr;
+    {
+      fprintf (stderr, "Skia: Failed to create GrDirectContext\n");
+      return nullptr;
+    }
 
   auto result = new emacs_skia_gl_context_t;
   result->context = grContext;
@@ -524,10 +596,12 @@ emacs_skia_surface_create_gl (emacs_skia_gl_context_t *ctx, int width,
   fbInfo.fFBOID = framebuffer_id;
   fbInfo.fFormat = format;
 
-  /* Create backend render target with 8-bit stencil buffer.  Skia needs
-     stencil for clip mask operations.  */
+  /* Create backend render target with stencil buffer for clip mask
+     operations.  */
   auto backendRT
-    = GrBackendRenderTargets::MakeGL (width, height, 0, 8, fbInfo);
+    = GrBackendRenderTargets::MakeGL (width, height,
+				      GL_SURFACE_MSAA_SAMPLES,
+				      GL_SURFACE_STENCIL_BITS, fbInfo);
 
   auto surface = SkSurfaces::
     WrapBackendRenderTarget (ctx->context.get (), backendRT,
@@ -592,13 +666,12 @@ emacs_skia_canvas_t *
 emacs_skia_surface_get_canvas (emacs_skia_surface_t *surface)
 {
   if (!surface || !surface->surface)
-    {
-      return nullptr;
-    }
+    return nullptr;
 
-  static emacs_skia_canvas_t canvas_wrapper;
-  canvas_wrapper.canvas = surface->surface->getCanvas ();
-  return &canvas_wrapper;
+  /* Use the per-surface canvas wrapper to avoid thread-safety issues.
+     The canvas pointer is borrowed from the SkSurface.  */
+  surface->canvas_wrapper.canvas = surface->surface->getCanvas ();
+  return &surface->canvas_wrapper;
 }
 
 void *
@@ -839,10 +912,8 @@ emacs_skia_canvas_draw_glyphs (emacs_skia_canvas_t *canvas, int count,
 			       emacs_skia_paint_t *paint)
 {
   if (!canvas || !canvas->canvas || !glyphs || !positions || !font
-      || !paint)
-    {
-      return;
-    }
+      || !paint || count <= 0)
+    return;
 
   /* Use stack buffer for small glyph counts to avoid heap allocation.
      Most text rendering fits within 64 glyphs per call.  */
@@ -1733,6 +1804,8 @@ struct emacs_skia_document
   sk_sp<SkDocument> document;
   std::unique_ptr<CallbackWStream> stream;
   SkCanvas *current_page; /* Borrowed from document */
+  /* Per-document canvas wrapper for thread safety.  */
+  emacs_skia_canvas canvas_wrapper;
 #else
   int dummy;
 #endif
@@ -1743,6 +1816,8 @@ struct emacs_skia_svg_canvas_data
 {
   std::unique_ptr<CallbackWStream> stream;
   std::unique_ptr<SkCanvas> canvas;
+  /* Per-SVG-canvas wrapper for thread safety.  */
+  emacs_skia_canvas canvas_wrapper;
 };
 
 #ifdef SK_PDF
@@ -1788,11 +1863,9 @@ emacs_skia_document_begin_page (emacs_skia_document_t *doc,
   if (!doc->current_page)
     return nullptr;
 
-  /* Return a wrapper - we use a static because the canvas is
-     owned by the document.  */
-  static emacs_skia_canvas_t canvas_wrapper;
-  canvas_wrapper.canvas = doc->current_page;
-  return &canvas_wrapper;
+  /* Use the per-document canvas wrapper for thread safety.  */
+  doc->canvas_wrapper.canvas = doc->current_page;
+  return &doc->canvas_wrapper;
 }
 
 void
@@ -1864,6 +1937,16 @@ emacs_skia_document_close (emacs_skia_document_t *doc)
 static std::map<SkCanvas *, emacs_skia_svg_canvas_data *>
   svg_canvas_map;
 
+/* Clean up any remaining SVG canvases that were not properly finished.
+   Called from emacs_skia_cleanup() to prevent memory leaks.  */
+static void
+cleanup_svg_canvas_map (void)
+{
+  for (auto &entry : svg_canvas_map)
+    delete entry.second;
+  svg_canvas_map.clear ();
+}
+
 emacs_skia_canvas_t *
 emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
 			      void *write_ctx, float width,
@@ -1884,9 +1967,9 @@ emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
 
   svg_canvas_map[data->canvas.get ()] = data;
 
-  static emacs_skia_canvas_t canvas_wrapper;
-  canvas_wrapper.canvas = data->canvas.get ();
-  return &canvas_wrapper;
+  /* Use the per-SVG-canvas wrapper for thread safety.  */
+  data->canvas_wrapper.canvas = data->canvas.get ();
+  return &data->canvas_wrapper;
 }
 
 void
