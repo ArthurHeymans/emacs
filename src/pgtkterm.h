@@ -456,9 +456,10 @@ struct pgtk_output
 #  ifdef SK_GL
   /* GDK GL context for GPU-accelerated rendering.  */
   GdkGLContext *gdk_gl_context;
-  /* GL framebuffer object and texture for offscreen rendering.  */
+  /* GL framebuffer object, texture, and stencil for offscreen rendering.  */
   unsigned int gl_framebuffer;
   unsigned int gl_texture;
+  unsigned int gl_stencil_renderbuffer;
   /* GtkGLArea widget for direct GL rendering (no Cairo).  */
   GtkWidget *gl_area;
   /* Track if GL initialization succeeded.  */
@@ -610,6 +611,8 @@ enum
 #   define FRAME_GL_FRAMEBUFFER(f) \
      ((f)->output_data.pgtk->gl_framebuffer)
 #   define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
+#   define FRAME_GL_STENCIL(f) \
+     ((f)->output_data.pgtk->gl_stencil_renderbuffer)
 #   define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
 #   define FRAME_SKIA_GL_INITIALIZED(f) \
      ((f)->output_data.pgtk->skia_gl_initialized)

@@ -8066,7 +8066,8 @@ pgtk_set_event_handler (struct frame *f)
     /* Request OpenGL 3.2 core profile for Skia compatibility.  */
     gtk_gl_area_set_required_version (GTK_GL_AREA (gl_area), 3, 2);
     gtk_gl_area_set_has_depth_buffer (GTK_GL_AREA (gl_area), FALSE);
-    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), FALSE);
+    /* Skia needs stencil buffer for clip mask operations.  */
+    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), TRUE);
     gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
 
     /* Connect GtkGLArea signals.  */
@@ -8964,10 +8965,19 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
   glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-  /* Bind the framebuffer and attach the texture.  */
+  /* Create or resize the stencil renderbuffer.  Skia needs this for
+     clip mask operations.  */
+  if (!FRAME_GL_STENCIL (f))
+    glGenRenderbuffers (1, &FRAME_GL_STENCIL (f));
+  glBindRenderbuffer (GL_RENDERBUFFER, FRAME_GL_STENCIL (f));
+  glRenderbufferStorage (GL_RENDERBUFFER, GL_STENCIL_INDEX8, width, height);
+
+  /* Bind the framebuffer and attach the texture and stencil.  */
   glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
   glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			  GL_TEXTURE_2D, FRAME_GL_TEXTURE (f), 0);
+  glFramebufferRenderbuffer (GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+			     GL_RENDERBUFFER, FRAME_GL_STENCIL (f));
 
   GLenum status = glCheckFramebufferStatus (GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
@@ -8976,7 +8986,7 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
   /* Clear the FBO to black initially to avoid garbage data.
      The actual background color will be set when Skia draws.  */
   glClearColor (0.0f, 0.0f, 0.0f, 1.0f);
-  glClear (GL_COLOR_BUFFER_BIT);
+  glClear (GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   glFinish ();
 
   /* Unbind the framebuffer.  */
@@ -9008,6 +9018,11 @@ pgtk_cleanup_gl_context (struct frame *f)
 	{
 	  glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
 	  FRAME_GL_TEXTURE (f) = 0;
+	}
+      if (FRAME_GL_STENCIL (f))
+	{
+	  glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
+	  FRAME_GL_STENCIL (f) = 0;
 	}
 
       /* We created this context ourselves, so unref it.  */

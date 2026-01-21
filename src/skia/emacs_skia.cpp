@@ -437,8 +437,10 @@ emacs_skia_surface_create_gl (emacs_skia_gl_context_t *ctx, int width,
   fbInfo.fFBOID = framebuffer_id;
   fbInfo.fFormat = format;
 
+  /* Create backend render target with 8-bit stencil buffer.  Skia needs
+     stencil for clip mask operations.  */
   auto backendRT
-    = GrBackendRenderTargets::MakeGL (width, height, 0, 0, fbInfo);
+    = GrBackendRenderTargets::MakeGL (width, height, 0, 8, fbInfo);
 
   auto surface = SkSurfaces::
     WrapBackendRenderTarget (ctx->context.get (), backendRT,
