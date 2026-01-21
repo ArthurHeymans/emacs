@@ -1,0 +1,409 @@
+EMACS SKIA BACKEND vs CAIRO: A TECHNICAL COMPARISON
+===================================================
+
+This document compares the experimental Skia 2D graphics backend with the
+traditional Cairo backend used in Emacs PGTK.
+
+
+OVERVIEW
+--------
+
+Cairo (Traditional)          | Skia (New)
+-----------------------------|------------------------------------
+CPU-based rasterization      | GPU-accelerated via OpenGL (Ganesh)
+Mature, battle-tested        | Experimental, modern
+C API                        | C++ core with C wrapper API
+Direct Cairo calls           | emacs_skia_* API calls
+
+
+ARCHITECTURE
+------------
+
+Cairo:
+  - Uses cairo_t context and cairo_surface_t
+  - Font rendering via cairo-ft (FreeType integration)
+  - Drawing operations are CPU-bound (see GPU INVOLVEMENT section)
+  - Double-buffering managed by GTK
+
+Skia:
+  - Uses emacs_skia_canvas_t and emacs_skia_surface_t
+  - Ganesh GPU backend via GrDirectContext
+  - Falls back to CPU raster when GL unavailable
+  - Integrates with GtkGLArea for hardware acceleration
+  - Custom C API wraps Skia's C++ internals
+
+
+CAIRO AND GPU INVOLVEMENT
+-------------------------
+
+A common misconception is that Cairo is purely CPU-based. The reality is
+more nuanced:
+
+Cairo's Drawing Operations (Always CPU):
+  - All cairo_* drawing calls (rectangles, paths, glyphs, etc.) execute
+    on the CPU using software rasterization
+  - Cairo does NOT use GPU shaders for drawing primitives
+  - The cairo-gl backend exists but is EXPERIMENTAL and NOT used in Emacs
+
+Cairo's Surface Types in Emacs PGTK:
+  - gdk_window_create_similar_surface() creates the drawing surface
+  - On X11: CAIRO_SURFACE_TYPE_XLIB or CAIRO_SURFACE_TYPE_XCB
+  - On Wayland: CAIRO_SURFACE_TYPE_IMAGE (pure software)
+  - These are all CPU-rasterized surfaces
+
+Where GPU IS Involved (Indirectly):
+  1. Compositor-Level Acceleration:
+     - The desktop compositor (Mutter, KWin, etc.) composites all windows
+     - This compositing typically uses OpenGL/Vulkan
+     - Cairo-rendered content becomes a texture that the GPU composites
+     - The actual Cairo drawing was still done by CPU
+
+  2. GTK's Display Pipeline:
+     - GTK3: Widgets draw to CPU surfaces, compositor handles GPU display
+     - GTK4/GSK: GskGLRenderer can GPU-composite GskCairoNode content
+       (but Cairo's drawing within the node is still CPU-based)
+
+  3. Wayland HiDPI Scaling:
+     - Wayland compositors can GPU-scale Cairo-rendered content
+     - This is scaling of already-rendered pixels, not GPU drawing
+
+The Rendering Pipeline:
+
+  Cairo (in Emacs PGTK):
+    Widget draw → Cairo CPU rasterization → GDK surface → Compositor GPU → Display
+                  ^^^^^^^^^^^^^^^^^^^^^^^^
+                  This part is always CPU
+
+  Skia (this backend):
+    Widget draw → Skia GPU rasterization → GtkGLArea FBO → Display
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+                  This part uses GPU directly
+
+Why This Matters:
+  - Cairo: CPU does all the work; GPU only composites the final result
+  - Skia: GPU does the actual drawing operations (rectangles, glyphs, etc.)
+  - For text-heavy applications like Emacs, glyph rendering is the bottleneck
+  - Skia can batch and GPU-accelerate glyph rendering directly
+
+What About cairo-gl?
+  - Cairo has an experimental OpenGL backend (cairo-gl)
+  - It is NOT production-ready and NOT used in Emacs
+  - From Cairo docs: "still experimental" since ~2010
+  - Not listed in Cairo 1.18's official surface type documentation
+
+
+BUILD CONFIGURATION
+-------------------
+
+Enable Skia:
+  ./configure --with-pgtk --with-skia
+
+Required defines (set automatically):
+  USE_SKIA=1     - Main Skia enable flag
+  SK_GL=1        - OpenGL/Ganesh backend
+  SK_GANESH=1    - GPU rendering
+
+Optional:
+  SK_PDF         - PDF export support
+  SK_SVG         - SVG export support
+
+
+API COMPARISON
+--------------
+
+Drawing Rectangles:
+
+  Cairo:
+    cairo_t *cr = pgtk_begin_cr_clip(f);
+    cairo_rectangle(cr, x, y, width, height);
+    cairo_fill(cr);
+    pgtk_end_cr_clip(f);
+
+  Skia:
+    emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS(f);
+    emacs_skia_paint_t *paint = FRAME_SKIA_PAINT(f);
+    emacs_skia_rect_t rect = {x, y, x+width, y+height};
+    emacs_skia_canvas_draw_rect(canvas, &rect, paint);
+
+Drawing Text/Glyphs:
+
+  Cairo:
+    cairo_show_glyphs(cr, glyphs, num_glyphs);
+
+  Skia:
+    emacs_skia_canvas_draw_glyphs(canvas, count, glyphs,
+                                   positions, origin, font, paint);
+
+State Management:
+
+  Cairo:
+    cairo_save(cr);
+    cairo_restore(cr);
+
+  Skia:
+    emacs_skia_canvas_save(canvas);
+    emacs_skia_canvas_restore(canvas);
+
+
+COLOR HANDLING
+--------------
+
+Cairo uses RGB (0xRRGGBB)
+Skia uses ARGB (0xAARRGGBB)
+
+Conversion helper:
+  static inline emacs_skia_color_t
+  pgtk_color_to_skia(unsigned long color)
+  {
+    return EMACS_SKIA_COLOR_RGB((color >> 16) & 0xff,
+                                (color >> 8) & 0xff,
+                                color & 0xff);
+  }
+
+
+FONT RENDERING
+--------------
+
+Cairo:
+  - Uses cairo-ft for FreeType integration
+  - cairo_scaled_font_t manages font instances
+  - cairo_glyph_t for glyph representation
+  - Subpixel rendering via cairo options
+
+Skia:
+  - Uses FreeType/fontconfig for font discovery
+  - emacs_skia_font_t wraps SkFont
+  - emacs_skia_typeface_t wraps SkTypeface
+  - Dedicated font driver: skiafont.c
+  - Configurable hinting: NONE, SLIGHT, NORMAL, FULL
+  - Configurable antialiasing: NONE, NORMAL, SUBPIXEL
+  - HarfBuzz integration via skiahbfont_driver
+
+Font Data Structure:
+
+  struct skia_font_info {
+    struct font_info base;          // FreeType base info
+    emacs_skia_typeface_t *skia_typeface;
+    emacs_skia_font_t *skia_font;
+  };
+
+
+SURFACE TYPES
+-------------
+
+Cairo (available types):
+  - cairo_image_surface_t (CPU raster)
+  - cairo_xlib_surface_t (X11 via XLib)
+  - cairo_xcb_surface_t (X11 via XCB)
+  - cairo_recording_surface_t (vector recording)
+  - cairo_pdf_surface_t, cairo_svg_surface_t
+  - cairo_gl_surface_t (EXPERIMENTAL - not used in Emacs)
+
+Cairo (actually used in Emacs PGTK):
+  - Created via gdk_window_create_similar_surface()
+  - X11: XLib or XCB surface (still CPU-rasterized, just uses X
+    shared memory for efficient transfer)
+  - Wayland: Image surface (pure CPU raster to memory buffer)
+  - Export: PDF, SVG, PNG surfaces
+
+Skia:
+  - Raster surface (CPU): emacs_skia_surface_create_raster()
+  - GL surface (GPU): emacs_skia_surface_create_gl()
+  - Pixel-wrapped surface: emacs_skia_surface_create_from_pixels()
+  - PDF document: emacs_skia_document_create_pdf()
+  - SVG canvas: emacs_skia_svg_canvas_create()
+
+Skia (actually used in Emacs):
+  - GL surface via GtkGLArea (primary, GPU-accelerated)
+  - Falls back to raster surface if GL unavailable
+
+
+BLEND MODES
+-----------
+
+Skia supports these blend modes (similar to Cairo operators):
+
+  EMACS_SKIA_BLEND_SRC        - Replace destination
+  EMACS_SKIA_BLEND_SRC_OVER   - Normal alpha compositing
+  EMACS_SKIA_BLEND_DST_OVER   - Draw behind destination
+  EMACS_SKIA_BLEND_CLEAR      - Clear destination
+  EMACS_SKIA_BLEND_XOR        - XOR compositing
+  EMACS_SKIA_BLEND_DIFFERENCE - Color difference
+  EMACS_SKIA_BLEND_EXCLUSION  - Exclusion blend
+
+
+DRAWING PRIMITIVES
+------------------
+
+                      Cairo                  Skia
+Rectangles            cairo_rectangle        emacs_skia_canvas_draw_rect
+Lines                 cairo_line_to          emacs_skia_canvas_draw_line
+Arcs                  cairo_arc              emacs_skia_canvas_draw_arc
+Paths                 cairo_path_t           emacs_skia_path_t
+Images                cairo_set_source_surface  emacs_skia_canvas_draw_image
+Glyphs                cairo_show_glyphs      emacs_skia_canvas_draw_glyphs
+Clipping              cairo_clip             emacs_skia_canvas_clip_rect
+
+
+PERFORMANCE CHARACTERISTICS
+---------------------------
+
+Cairo:
+  + Mature codebase, predictable performance
+  + No GPU driver dependencies
+  + Low memory overhead
+  + Works identically everywhere (no driver variance)
+  - CPU-bound for ALL drawing operations
+  - Glyph rendering can bottleneck on CPU
+  - Complex compositing competes with Emacs Lisp for CPU
+  - X11 surfaces may have some XRender acceleration for
+    simple operations (fills, blits) depending on driver
+
+Skia:
+  + GPU acceleration for most operations
+  + Efficient batching of draw calls
+  + Hardware-accelerated image transformations
+  + Optimized glyph caching on GPU
+  + Drawing doesn't compete with Emacs Lisp for CPU
+  - Requires OpenGL 3.2+ support
+  - Higher memory usage (GPU VRAM for textures)
+  - Potential driver compatibility issues
+  - GPU context switching overhead for small operations
+
+Skia Optimizations in This Implementation:
+  - FBO content preservation during resize
+  - Surface snapshots for scrolling (GPU texture copy)
+  - Lazy surface creation
+  - Glyph metrics caching
+  - Fringe bitmap caching as Skia images (uploaded once to GPU)
+  - Reusable paint objects per frame
+  - Direct FBO blitting via GtkGLArea
+
+Where Skia Helps Most:
+  - Scrolling large buffers (GPU texture operations)
+  - Image-heavy content (transformations, scaling)
+  - High-DPI displays (more pixels to rasterize)
+  - Complex faces with many attributes
+  - Systems where CPU is the bottleneck
+
+Where Cairo May Be Comparable:
+  - Simple text editing (glyph rendering is fast either way)
+  - Small windows/low resolution
+  - Systems with fast CPUs but weak GPUs
+  - When compositor already provides smooth scrolling
+
+
+FRAME DATA STRUCTURES
+---------------------
+
+struct pgtk_output {
+  // Skia-specific fields
+  emacs_skia_surface_t *skia_surface;
+  emacs_skia_canvas_t *skia_canvas;
+  emacs_skia_gl_context_t *skia_gl_context;
+  int skia_surface_desired_width;
+  int skia_surface_desired_height;
+  emacs_skia_paint_t *skia_paint;
+  emacs_skia_surface_t *skia_surface_visible_bell;
+  bool skia_gl_initialized;
+};
+
+Accessor macros:
+  FRAME_SKIA_SURFACE(f)
+  FRAME_SKIA_CANVAS(f)
+  FRAME_SKIA_GL_CONTEXT(f)
+  FRAME_SKIA_PAINT(f)
+
+
+IMAGE HANDLING
+--------------
+
+Cairo:
+  - cairo_surface_t for image data
+  - ARGB32, RGB24, A8 formats
+  - Pattern-based image drawing
+
+Skia:
+  - emacs_skia_image_t wraps SkImage
+  - RGBA and BGRA pixel formats
+  - Direct encoded format support (PNG, JPEG)
+  - 1-bit bitmap support for fringe/stipples
+  - Image transformation support (rotation, scaling)
+  - Image shader for stipple patterns
+
+
+EXPORT CAPABILITIES
+-------------------
+
+Cairo:
+  - PDF via cairo_pdf_surface_t
+  - SVG via cairo_svg_surface_t
+  - PNG via cairo_surface_write_to_png()
+
+Skia:
+  - PDF via emacs_skia_document_create_pdf()
+  - SVG via emacs_skia_svg_canvas_create()
+  - PNG via emacs_skia_surface_write_to_png() / emacs_skia_image_write_to_png()
+  - All use callback-based output (emacs_skia_write_fn)
+
+
+LIMITATIONS
+-----------
+
+Current Skia backend limitations:
+  - Marked as "experimental" in configure
+  - Requires Skia library with fontconfig+FreeType support
+  - GL backend requires OpenGL support in GTK
+  - PDF/SVG support depends on Skia build options
+  - Some operations still fall back to Cairo (e.g., cross drawing)
+
+
+KEY FILES
+---------
+
+Skia Implementation:
+  src/skia/emacs_skia.cpp   - Main Skia C API implementation
+  src/skia/emacs_skia.h     - Public C API header
+  src/skiafont.c            - Skia font driver
+
+Integration:
+  src/pgtkterm.c            - PGTK terminal with Skia integration
+  src/pgtkterm.h            - PGTK output structure with Skia fields
+  src/image.c               - Image handling with Skia support
+
+Build:
+  configure.ac              - --with-skia option
+  src/Makefile.in           - Skia object compilation
+
+
+MIGRATION PATH
+--------------
+
+For code using Cairo, the general migration pattern is:
+
+1. Replace cairo_t* with emacs_skia_canvas_t*
+2. Replace cairo_surface_t* with emacs_skia_surface_t*
+3. Use FRAME_SKIA_CANVAS(f) instead of pgtk_begin_cr_clip(f)
+4. Convert colors using pgtk_color_to_skia()
+5. Replace cairo drawing calls with emacs_skia_canvas_draw_*
+6. Use emacs_skia_paint_t for style settings
+
+
+CONCLUSION
+----------
+
+The Skia backend provides GPU-accelerated rendering for Emacs, offering
+potential performance benefits for compositing-heavy operations and modern
+display hardware. Cairo remains the stable, proven choice for CPU-based
+rendering without GPU dependencies.
+
+Choose Skia when:
+  - GPU acceleration is desired
+  - Modern OpenGL support is available
+  - Performance with complex compositing is important
+
+Choose Cairo when:
+  - Maximum compatibility is needed
+  - GPU drivers are unreliable
+  - Lower memory usage is preferred
+  - Stability is paramount
