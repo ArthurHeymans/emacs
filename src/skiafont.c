@@ -241,8 +241,49 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
       font->ascent = lround (extents.ascent);
       font->descent = lround (extents.descent);
       font->height = lround (extents.height);
-      font->min_width = font->average_width = font->space_width
-	= lround (extents.max_x_advance);
+
+      /* Calculate average_width properly by measuring printable ASCII
+	 characters, similar to ftfont.c.  Using max_x_advance would give
+	 the maximum character width, which is incorrect for proportional
+	 fonts and causes issues with image scaling.  */
+      {
+	int total_width = 0, n = 0, min_w = 0, space_w = 0;
+
+	for (int c = 32; c < 127; c++)
+	  {
+	    emacs_skia_glyph_t glyph
+	      = emacs_skia_font_char_to_glyph (skiafont_info->skia_font, c);
+	    if (glyph != 0)
+	      {
+		emacs_skia_glyph_extents_t glyph_ext;
+		emacs_skia_font_get_glyph_extents (skiafont_info->skia_font,
+						   &glyph, 1, &glyph_ext);
+		int w = lround (glyph_ext.x_advance);
+		if (w > 0)
+		  {
+		    total_width += w;
+		    n++;
+		    if (min_w == 0 || w < min_w)
+		      min_w = w;
+		    if (c == 32)
+		      space_w = w;
+		  }
+	      }
+	  }
+
+	if (n > 0)
+	  {
+	    font->average_width = total_width / n;
+	    font->min_width = min_w;
+	    font->space_width = space_w > 0 ? space_w : font->average_width;
+	  }
+	else
+	  {
+	    /* Fallback to max_x_advance if we couldn't measure characters.  */
+	    font->min_width = font->average_width = font->space_width
+	      = lround (extents.max_x_advance);
+	  }
+      }
     }
   else
     {

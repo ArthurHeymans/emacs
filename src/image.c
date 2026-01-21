@@ -4161,7 +4161,7 @@ image_create_x_image_and_pixmap_1 (struct frame *f, int width, int height, int d
                                    Emacs_Pix_Container *pimg,
                                    Emacs_Pixmap *pixmap, Picture *picture)
 {
-#ifdef USE_CAIRO
+#if defined USE_CAIRO || defined USE_SKIA
   eassert (input_blocked_p ());
 
   /* Allocate a pixmap of the same size.  */
@@ -4325,11 +4325,11 @@ image_destroy_x_image (Emacs_Pix_Container pimg)
   eassert (input_blocked_p ());
   if (pimg)
     {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+#if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU || defined HAVE_NS
       /* On these systems, Emacs_Pix_Containers always point to the same
 	 data as pixmaps in `struct image', and therefore must never be
 	 freed separately.  */
-#endif	/* USE_CAIRO || HAVE_HAIKU || HAVE_NS */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_HAIKU || HAVE_NS */
 #ifdef HAVE_NTGUI
       /* Data will be freed by DestroyObject.  */
       pimg->data = NULL;
@@ -4348,7 +4348,7 @@ static void
 gui_put_x_image (struct frame *f, Emacs_Pix_Container pimg,
                  Emacs_Pixmap pixmap, int width, int height)
 {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+#if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU || defined HAVE_NS
   eassert (pimg == pixmap);
 #elif defined HAVE_X_WINDOWS
   GC gc;
@@ -4464,7 +4464,7 @@ image_unget_x_image_or_dc (struct image *img, bool mask_p,
 static Emacs_Pix_Container
 image_get_x_image (struct frame *f, struct image *img, bool mask_p)
 {
-#if defined USE_CAIRO || defined (HAVE_HAIKU)
+#if defined USE_CAIRO || defined USE_SKIA || defined (HAVE_HAIKU)
   return !mask_p ? img->pixmap : img->mask;
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
   XImage *ximg_in_img = !mask_p ? img->ximg : img->mask_img;
@@ -5560,8 +5560,8 @@ static bool xpm_load (struct frame *f, struct image *img);
 #endif /* not HAVE_NTGUI */
 #endif /* HAVE_XPM */
 
-#if defined HAVE_XPM || defined USE_CAIRO || defined HAVE_NS	\
-  || defined HAVE_HAIKU || defined HAVE_ANDROID
+#if defined HAVE_XPM || defined USE_CAIRO || defined USE_SKIA \
+  || defined HAVE_NS || defined HAVE_HAIKU || defined HAVE_ANDROID
 
 /* Indices of image specification fields in xpm_format, below.  */
 
@@ -5920,7 +5920,7 @@ x_create_bitmap_from_xpm_data (struct frame *f, const char **bits)
 /* Load image IMG which will be displayed on frame F.  Value is
    true if successful.  */
 
-#if defined HAVE_XPM && !defined USE_CAIRO
+#if defined HAVE_XPM && !defined USE_CAIRO && !defined USE_SKIA
 
 static bool
 xpm_load (struct frame *f, struct image *img)
@@ -6229,9 +6229,10 @@ xpm_load (struct frame *f, struct image *img)
   return rc == XpmSuccess;
 }
 
-#endif /* HAVE_XPM && !USE_CAIRO */
+#endif /* HAVE_XPM && !USE_CAIRO && !USE_SKIA */
 
 #if (defined USE_CAIRO && defined HAVE_XPM)	\
+  || (defined USE_SKIA && defined HAVE_XPM)	\
   || (defined HAVE_NS && !defined HAVE_XPM)	\
   || (defined HAVE_HAIKU && !defined HAVE_XPM)  \
   || (defined HAVE_PGTK && !defined HAVE_XPM)	\
@@ -6628,7 +6629,7 @@ xpm_load_image (struct frame *f,
     }
 
   unsigned long frame_fg = FRAME_FOREGROUND_PIXEL (f);
-#ifdef USE_CAIRO
+#if defined USE_CAIRO || defined USE_SKIA
   {
     Emacs_Color color = {.pixel = frame_fg};
     FRAME_TERMINAL (f)->query_colors (f, &color, 1);
@@ -6738,7 +6739,7 @@ xpm_load (struct frame *f,
   return success_p;
 }
 
-#endif /* HAVE_NS && !HAVE_XPM */
+#endif /* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_HAIKU || HAVE_PGTK || HAVE_ANDROID (internal XPM parser) */
 
 
 
@@ -6999,8 +7000,8 @@ lookup_rgb_color (struct frame *f, int r, int g, int b)
 {
 #ifdef HAVE_NTGUI
   return PALETTERGB (r >> 8, g >> 8, b >> 8);
-#elif defined USE_CAIRO || defined HAVE_NS || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID
+#elif defined USE_CAIRO || defined USE_SKIA || defined HAVE_NS	\
+  || defined HAVE_HAIKU || defined HAVE_ANDROID
   return RGB_TO_ULONG (r >> 8, g >> 8, b >> 8);
 #else
   xsignal1 (Qfile_error,
@@ -7073,8 +7074,8 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
   p = colors;
   for (y = 0; y < img->height; ++y)
     {
-#if !defined USE_CAIRO && !defined HAVE_NS && !defined HAVE_HAIKU	\
-  && !defined HAVE_ANDROID
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_NS	\
+  && !defined HAVE_HAIKU && !defined HAVE_ANDROID
       Emacs_Color *row = p;
       for (x = 0; x < img->width; ++x, ++p)
 	p->pixel = GET_PIXEL (ximg, x, y);
@@ -7082,7 +7083,7 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
         {
           FRAME_TERMINAL (f)->query_colors (f, row, img->width);
         }
-#else  /* USE_CAIRO || HAVE_NS || HAVE_HAIKU || HAVE_ANDROID */
+#else  /* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_HAIKU || HAVE_ANDROID */
       for (x = 0; x < img->width; ++x, ++p)
 	{
 	  p->pixel = GET_PIXEL (ximg, x, y);
@@ -7093,7 +7094,7 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
 	      p->blue = BLUE16_FROM_ULONG (p->pixel);
 	    }
 	}
-#endif	/* USE_CAIRO || HAVE_NS || HAVE_ANDROID */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_ANDROID */
     }
 
   image_unget_x_image_or_dc (img, 0, ximg, prev);
@@ -7324,8 +7325,8 @@ image_edge_detection (struct frame *f, struct image *img,
 }
 
 
-#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID
+#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined USE_SKIA \
+  || defined HAVE_HAIKU || defined HAVE_ANDROID
 
 static void
 image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
@@ -7352,6 +7353,29 @@ image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
   cairo_set_line_width (cr, 1);
   cairo_stroke (cr);
   cairo_destroy (cr);
+#elif defined USE_SKIA
+  /* For Skia without Cairo, draw the cross directly on the pixel data.  */
+  if (pixmap && pixmap->data && pixmap->bits_per_pixel == 32)
+    {
+      uint32_t *data = (uint32_t *) pixmap->data;
+      int stride = pixmap->bytes_per_line / 4;
+      uint32_t pixel = 0xFF000000 | (color & 0xFFFFFF); /* ARGB */
+
+      /* Draw diagonal line from top-left to bottom-right.  */
+      for (unsigned int i = 0; i < width && i < height; i++)
+	{
+	  int px = x + i, py = y + i;
+	  if (px >= 0 && px < pixmap->width && py >= 0 && py < pixmap->height)
+	    data[py * stride + px] = pixel;
+	}
+      /* Draw diagonal line from bottom-left to top-right.  */
+      for (unsigned int i = 0; i < width && i < height; i++)
+	{
+	  int px = x + i, py = y + height - 1 - i;
+	  if (px >= 0 && px < pixmap->width && py >= 0 && py < pixmap->height)
+	    data[py * stride + px] = pixel;
+	}
+    }
 #elif HAVE_X_WINDOWS
   Display *dpy = FRAME_X_DISPLAY (f);
   GC gc = XCreateGC (dpy, pixmap, 0, NULL);
@@ -7420,17 +7444,17 @@ image_disable_image (struct frame *f, struct image *img)
 #ifndef HAVE_NTGUI
 #ifndef HAVE_NS  /* TODO: NS support, however this not needed for toolbars */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU && !defined HAVE_ANDROID
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU && !defined HAVE_ANDROID
 #define CrossForeground(f) BLACK_PIX_DEFAULT (f)
 #define MaskForeground(f)  WHITE_PIX_DEFAULT (f)
-#else  /* USE_CAIRO || HAVE_HAIKU */
+#else  /* USE_CAIRO || USE_SKIA || HAVE_HAIKU */
 #define CrossForeground(f) 0
 #define MaskForeground(f)  PIX_MASK_DRAW
-#endif	/* USE_CAIRO || HAVE_HAIKU */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_HAIKU */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU
       image_sync_to_pixmaps (f, img);
-#endif	/* !USE_CAIRO && !HAVE_HAIKU */
+#endif	/* !USE_CAIRO && !USE_SKIA && !HAVE_HAIKU */
       image_pixmap_draw_cross (f, img->pixmap, 0, 0, img->width, img->height,
 			       CrossForeground (f));
       if (img->mask)
