@@ -1,0 +1,33 @@
+
+================================================================================
+EMACS RENDERING BENCHMARK: Cairo (CPU) vs Skia GL (GPU)
+================================================================================
+Test                 Cairo              Skia GL            Diff         Winner
+                     avg (ms)           avg (ms)                        
+--------------------------------------------------------------------------------
+images-display       27.9 +/- 1.4       28.2 +/- 1.5       -1.2%        Cairo +1.0x
+images-scroll        329.0 +/- 30.8     233.0 +/- 19.8     +29.2%       Skia +1.4x
+redraw-colors        390.0 +/- 38.1     262.4 +/- 6.2      +32.7%       Skia +1.5x
+redraw-force         167.7 +/- 30.9     132.4 +/- 2.5      +21.1%       Skia +1.3x
+resize-frame         57.4 +/- 3.5       64.7 +/- 2.8       -12.8%       Cairo +1.1x
+scroll-line          1058.5 +/- 106.4   781.4 +/- 21.4     +26.2%       Skia +1.4x
+scroll-page          336.9 +/- 6.9      379.5 +/- 20.0     -12.6%       Cairo +1.1x
+scroll-random        1338.3 +/- 137.2   1247.9 +/- 30.9    +6.8%        Skia +1.1x
+text-code            44.9 +/- 1.3       47.9 +/- 1.3       -6.6%        Cairo +1.1x
+text-faces           48.5 +/- 9.0       38.8 +/- 1.8       +19.9%       Skia +1.2x
+text-unicode         46.4 +/- 6.0       48.4 +/- 2.5       -4.3%        Cairo +1.0x
+--------------------------------------------------------------------------------
+
+SUMMARY
+================================================================================
+Total time (all tests):  Cairo: 3845.5 ms  |  Skia GL: 3264.6 ms
+Overall:                 Skia GL is 1.18x faster
+Tests won:               Skia GL: 6  |  Cairo: 5
+
+BY CATEGORY:
+----------------------------------------
+  Text Rendering     Skia 1.03x faster
+  Scrolling          Skia 1.13x faster
+  Images             Skia 1.37x faster
+  Redraw             Skia 1.34x faster
+================================================================================
