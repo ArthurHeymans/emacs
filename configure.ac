@@ -4577,6 +4577,40 @@ if test "${with_skia}" = "yes"; then
       *-lstdc++*) ;;
       *) SKIA_LIBS="$SKIA_LIBS -lstdc++" ;;
     esac
+
+    dnl Auto-detect OpenGL support for Skia GPU acceleration
+    dnl We use libepoxy which GTK3 already depends on
+    dnl SK_GANESH is required by Skia to enable the Ganesh GPU backend,
+    dnl without it SK_GL gets undefined by SkTypes.h
+    HAVE_SKIA_GL=no
+    AC_MSG_CHECKING([for OpenGL support (libepoxy) for Skia GPU acceleration])
+    PKG_CHECK_EXISTS([epoxy], [
+      PKG_CHECK_MODULES([EPOXY], [epoxy], [
+        HAVE_SKIA_GL=yes
+        AC_DEFINE([SK_GL], [1], [Define to 1 if Skia GL backend is available.])
+        AC_DEFINE([SK_GANESH], [1], [Define to 1 to enable Skia Ganesh GPU backend.])
+        SKIA_CFLAGS="$SKIA_CFLAGS -DSK_GL=1 -DSK_GANESH=1 $EPOXY_CFLAGS"
+        SKIA_LIBS="$SKIA_LIBS $EPOXY_LIBS"
+        AC_MSG_RESULT([yes])
+      ], [
+        AC_MSG_RESULT([no (libepoxy not usable)])
+      ])
+    ], [
+      dnl Try direct GL detection as fallback
+      AC_CHECK_LIB([GL], [glClear], [
+        HAVE_SKIA_GL=yes
+        AC_DEFINE([SK_GL], [1], [Define to 1 if Skia GL backend is available.])
+        AC_DEFINE([SK_GANESH], [1], [Define to 1 to enable Skia Ganesh GPU backend.])
+        SKIA_CFLAGS="$SKIA_CFLAGS -DSK_GL=1 -DSK_GANESH=1"
+        SKIA_LIBS="$SKIA_LIBS -lGL"
+        AC_MSG_RESULT([yes (direct libGL)])
+      ], [
+        AC_MSG_RESULT([no])
+        AC_MSG_WARN([OpenGL not found. Skia will use CPU rendering only.])
+      ])
+    ])
+    AC_SUBST([HAVE_SKIA_GL])
+
     AC_SUBST([SKIA_CFLAGS])
     AC_SUBST([SKIA_LIBS])
     AC_MSG_RESULT([yes])

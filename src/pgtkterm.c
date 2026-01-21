@@ -80,6 +80,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 
 #ifdef USE_SKIA
 # include "skia/emacs_skia.h"
+# ifdef SK_GL
+#  include <epoxy/gl.h> /* For GL types and functions */
+# endif
 
 /* Convert Emacs pixel color (0xRRGGBB) to Skia color (0xAARRGGBB). */
 static inline emacs_skia_color_t
@@ -151,6 +154,16 @@ static void pgtk_skia_clip_to_row (struct window *,
 				   struct glyph_row *,
 				   enum glyph_row_area,
 				   emacs_skia_canvas_t *);
+static void pgtk_skia_set_clip_rectangles (struct frame *,
+					   emacs_skia_canvas_t *,
+					   XRectangle *, int);
+static void
+pgtk_skia_set_glyph_string_clipping (struct glyph_string *,
+				     emacs_skia_canvas_t *);
+static void
+pgtk_skia_set_glyph_string_clipping_exactly (struct glyph_string *,
+					     struct glyph_string *,
+					     emacs_skia_canvas_t *);
 #else
 static void pgtk_clip_to_row (struct window *, struct glyph_row *,
 			      enum glyph_row_area, cairo_t *);
@@ -1311,6 +1324,36 @@ pgtk_set_glyph_string_gc (struct glyph_string *s)
 /* Set clipping for output of glyph string S.  S may be part of a mode
    line or menu if we don't have X toolkit support.  */
 
+#ifdef USE_SKIA
+static void
+pgtk_skia_set_glyph_string_clipping (struct glyph_string *s,
+				     emacs_skia_canvas_t *canvas)
+{
+  XRectangle r[2];
+  int n = get_glyph_string_clip_rects (s, r, 2);
+
+  if (n > 0)
+    pgtk_skia_set_clip_rectangles (s->f, canvas, r, n);
+}
+
+static void
+pgtk_skia_set_glyph_string_clipping_exactly (
+  struct glyph_string *src, struct glyph_string *dst,
+  emacs_skia_canvas_t *canvas)
+{
+  dst->clip[0].x = src->x;
+  dst->clip[0].y = src->y;
+  dst->clip[0].width = src->width;
+  dst->clip[0].height = src->height;
+  dst->num_clips = 1;
+
+  emacs_skia_rect_t rect
+    = { src->x, src->y, src->x + src->width, src->y + src->height };
+  emacs_skia_canvas_clip_rect (canvas, &rect);
+}
+#endif
+
+#ifdef USE_CAIRO
 static void
 pgtk_set_glyph_string_clipping (struct glyph_string *s, cairo_t *cr)
 {
@@ -1346,6 +1389,7 @@ pgtk_set_glyph_string_clipping_exactly (struct glyph_string *src,
   cairo_rectangle (cr, src->x, src->y, src->width, src->height);
   cairo_clip (cr);
 }
+#endif
 
 /* RIF:
    Compute left and right overhang of glyph string S.  */
@@ -2929,6 +2973,11 @@ static void
 pgtk_draw_glyph_string (struct glyph_string *s)
 {
   bool relief_drawn_p = false;
+#ifdef USE_SKIA
+  emacs_skia_canvas_t *canvas;
+#else
+  cairo_t *cr;
+#endif
 
   /* If S draws into the background of its successors, draw the
      background of the successors first so that S can draw into it.
@@ -2944,22 +2993,36 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 	   width += next->width, next = next->next)
 	if (next->first_glyph->type != IMAGE_GLYPH)
 	  {
-	    cairo_t *cr = pgtk_begin_cr_clip (next->f);
+#ifdef USE_SKIA
+	    canvas = pgtk_begin_skia_clip (next->f);
+	    pgtk_set_glyph_string_gc (next);
+	    pgtk_skia_set_glyph_string_clipping (next, canvas);
+#else
+	    cr = pgtk_begin_cr_clip (next->f);
 	    pgtk_set_glyph_string_gc (next);
 	    pgtk_set_glyph_string_clipping (next, cr);
+#endif
 	    if (next->first_glyph->type == STRETCH_GLYPH)
 	      pgtk_draw_stretch_glyph_string (next);
 	    else
 	      pgtk_draw_glyph_string_background (next, true);
 	    next->num_clips = 0;
+#ifdef USE_SKIA
+	    pgtk_end_skia_clip (next->f);
+#else
 	    pgtk_end_cr_clip (next->f);
+#endif
 	  }
     }
 
   /* Set up S->gc, set clipping and draw S.  */
   pgtk_set_glyph_string_gc (s);
 
-  cairo_t *cr = pgtk_begin_cr_clip (s->f);
+#ifdef USE_SKIA
+  canvas = pgtk_begin_skia_clip (s->f);
+#else
+  cr = pgtk_begin_cr_clip (s->f);
+#endif
 
   /* Draw relief (if any) in advance for char/composition so that the
      glyph string can be drawn over it.  */
@@ -2968,10 +3031,17 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 	  || s->first_glyph->type == COMPOSITE_GLYPH))
 
     {
+#ifdef USE_SKIA
+      pgtk_skia_set_glyph_string_clipping (s, canvas);
+      pgtk_draw_glyph_string_background (s, true);
+      pgtk_draw_glyph_string_box (s);
+      pgtk_skia_set_glyph_string_clipping (s, canvas);
+#else
       pgtk_set_glyph_string_clipping (s, cr);
       pgtk_draw_glyph_string_background (s, true);
       pgtk_draw_glyph_string_box (s);
       pgtk_set_glyph_string_clipping (s, cr);
+#endif
       relief_drawn_p = true;
     }
   else if (!s->clip_head /* draw_glyphs didn't specify a clip mask. */
@@ -2979,12 +3049,18 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 	   && ((s->prev && s->prev->hl != s->hl && s->left_overhang)
 	       || (s->next && s->next->hl != s->hl
 		   && s->right_overhang)))
-    /* We must clip just this glyph.  left_overhang part has already
-       drawn when s->prev was drawn, and right_overhang part will be
-       drawn later when s->next is drawn. */
+  /* We must clip just this glyph.  left_overhang part has already
+     drawn when s->prev was drawn, and right_overhang part will be
+     drawn later when s->next is drawn. */
+#ifdef USE_SKIA
+    pgtk_skia_set_glyph_string_clipping_exactly (s, s, canvas);
+  else
+    pgtk_skia_set_glyph_string_clipping (s, canvas);
+#else
     pgtk_set_glyph_string_clipping_exactly (s, s, cr);
   else
     pgtk_set_glyph_string_clipping (s, cr);
+#endif
 
   switch (s->first_glyph->type)
     {
@@ -3195,15 +3271,25 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 
 		prev->hl = s->hl;
 		pgtk_set_glyph_string_gc (prev);
+#ifdef USE_SKIA
+		emacs_skia_canvas_save (canvas);
+		pgtk_skia_set_glyph_string_clipping_exactly (s, prev,
+							     canvas);
+#else
 		cairo_save (cr);
 		pgtk_set_glyph_string_clipping_exactly (s, prev, cr);
+#endif
 		if (prev->first_glyph->type == CHAR_GLYPH)
 		  pgtk_draw_glyph_string_foreground (prev);
 		else
 		  pgtk_draw_composite_glyph_string_foreground (prev);
 		prev->hl = save;
 		prev->num_clips = 0;
+#ifdef USE_SKIA
+		emacs_skia_canvas_restore (canvas);
+#else
 		cairo_restore (cr);
+#endif
 	      }
 	}
 
@@ -3222,13 +3308,23 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 
 		next->hl = s->hl;
 		pgtk_set_glyph_string_gc (next);
+#ifdef USE_SKIA
+		emacs_skia_canvas_save (canvas);
+		pgtk_skia_set_glyph_string_clipping_exactly (s, next,
+							     canvas);
+#else
 		cairo_save (cr);
 		pgtk_set_glyph_string_clipping_exactly (s, next, cr);
+#endif
 		if (next->first_glyph->type == CHAR_GLYPH)
 		  pgtk_draw_glyph_string_foreground (next);
 		else
 		  pgtk_draw_composite_glyph_string_foreground (next);
+#ifdef USE_SKIA
+		emacs_skia_canvas_restore (canvas);
+#else
 		cairo_restore (cr);
+#endif
 		next->hl = save;
 		next->num_clips = 0;
 		next->clip_head = s->next;
@@ -3242,7 +3338,11 @@ pgtk_draw_glyph_string (struct glyph_string *s)
     s->row->stipple_p = s->face->stipple;
 
   /* Reset clipping.  */
+#ifdef USE_SKIA
+  pgtk_end_skia_clip (s->f);
+#else
   pgtk_end_cr_clip (s->f);
+#endif
   s->num_clips = 0;
 }
 
@@ -3634,10 +3734,8 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 	  pgtk_end_skia_clip (f);
 	  emacs_skia_image_destroy (snapshot);
 	}
-      return;
     }
-#endif
-
+#else
   cairo_t *cr;
   cairo_surface_t *surface; /* temporary surface */
 
@@ -3664,6 +3762,7 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
   pgtk_end_cr_clip (f);
 
   cairo_surface_destroy (surface);
+#endif
 }
 
 /* Scroll part of the display as described by RUN.  */
@@ -4040,10 +4139,64 @@ pgtk_frame_up_to_date (struct frame *f)
 {
   block_input ();
   FRAME_MOUSE_UPDATE (f);
+
+#if defined(USE_SKIA) && defined(SK_GL)
+  /* For Skia GL rendering, bypass the buffer_flipping_blocked check
+     since we don't use Cairo's double-buffering mechanism.  */
+  if (FRAME_GDK_GL_CONTEXT (f) && FRAME_GL_TEXTURE (f))
+    {
+      /* Frame pacing: limit to ~60 FPS (16.6ms) to reduce flickering
+	 over waypipe.  Skip frame if we rendered too recently.  */
+      gint64 now = g_get_monotonic_time ();
+      gint64 elapsed = now - FRAME_LAST_RENDER_TIME (f);
+      /* 16000 microseconds = 16ms ~ 60 FPS.  Use 8ms for smoother
+	 response.  */
+      const gint64 min_frame_interval = 8000;
+
+      if (FRAME_LAST_RENDER_TIME (f) > 0
+	  && elapsed < min_frame_interval)
+	{
+	  /* Too soon - skip this frame.  The next
+	     pgtk_frame_up_to_date call will trigger a render.  */
+	  unblock_input ();
+	  return;
+	}
+
+      FRAME_LAST_RENDER_TIME (f) = now;
+
+      /* Flush Skia first.  */
+      if (FRAME_SKIA_SURFACE (f))
+	emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+
+      /* Queue a render on the GtkGLArea.  */
+      if (FRAME_GL_AREA (f))
+	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      unblock_input ();
+      return;
+    }
+#endif
+
   if (!buffer_flipping_blocked_p ())
     {
-      flip_cr_context (f);
-      gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+#ifdef USE_SKIA
+      /* For Skia raster (no GL), queue a regular draw.  */
+      if (FRAME_SKIA_SURFACE (f))
+	{
+	  if (FRAME_GL_AREA (f))
+	    gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+	  else
+	    gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+	}
+      else
+#endif
+	{
+#ifdef USE_CAIRO
+	  flip_cr_context (f);
+#endif
+	  gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+	}
     }
   unblock_input ();
 }
@@ -5738,8 +5891,30 @@ static void
 pgtk_buffer_flipping_unblocked_hook (struct frame *f)
 {
   block_input ();
-  flip_cr_context (f);
-  gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+#ifdef USE_SKIA
+  /* For Skia (both GL and raster), queue a draw on the widget.
+     The GtkGLArea render callback will blit from the GL FBO.  */
+  if (FRAME_SKIA_SURFACE (f))
+    {
+      /* Flush Skia first.  */
+      emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+# ifdef SK_GL
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+      if (FRAME_GL_AREA (f))
+	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      else
+# endif
+	gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+    }
+  else
+#endif
+    {
+#ifdef USE_CAIRO
+      flip_cr_context (f);
+#endif
+      gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+    }
   unblock_input ();
 }
 
@@ -5991,61 +6166,63 @@ static gboolean
 pgtk_handle_draw (GtkWidget *widget, cairo_t *cr, gpointer *data)
 {
   struct frame *f;
-
   GdkWindow *win = gtk_widget_get_window (widget);
 
-  if (win != NULL)
-    {
-      f = pgtk_any_window_to_frame (win);
-      if (f != NULL)
-	{
+  if (win == NULL)
+    return FALSE;
+
+  f = pgtk_any_window_to_frame (win);
+  if (f == NULL)
+    return FALSE;
+
 #ifdef USE_SKIA
-	  /* When using Skia, blit the Skia surface to Cairo.  */
-	  emacs_skia_surface_t *skia_surface;
+  /* This function is used for tooltips and as a fallback for raster
+     surfaces.  For GL rendering, GtkGLArea handles display.  */
+  emacs_skia_surface_t *skia_surface;
 
-	  /* Use visible bell surface if active, otherwise main
-	   * surface */
-	  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
-	    skia_surface
-	      = FRAME_X_OUTPUT (f)->skia_surface_visible_bell;
-	  else
-	    skia_surface = FRAME_SKIA_SURFACE (f);
+  /* Use visible bell surface if active, otherwise main surface.  */
+  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
+    skia_surface = FRAME_X_OUTPUT (f)->skia_surface_visible_bell;
+  else
+    skia_surface = FRAME_SKIA_SURFACE (f);
 
-	  if (skia_surface)
-	    {
-	      emacs_skia_surface_flush (skia_surface);
-	      void *pixels
-		= emacs_skia_surface_get_pixels (skia_surface);
-	      if (pixels)
-		{
-		  int width
-		    = emacs_skia_surface_get_width (skia_surface);
-		  int height
-		    = emacs_skia_surface_get_height (skia_surface);
-		  cairo_surface_t *skia_cairo_surface
-		    = cairo_image_surface_create_for_data (
-		      pixels, CAIRO_FORMAT_ARGB32, width, height,
-		      width * 4);
-		  cairo_set_source_surface (cr, skia_cairo_surface, 0,
-					    0);
-		  cairo_paint (cr);
-		  cairo_surface_destroy (skia_cairo_surface);
-		  return FALSE;
-		}
-	    }
-#else
-	  cairo_surface_t *src = NULL;
-	  src = FRAME_X_OUTPUT (f)->cr_surface_visible_bell;
-	  if (src == NULL && FRAME_CR_ACTIVE_CONTEXT (f) != NULL)
-	    src = cairo_get_target (FRAME_CR_ACTIVE_CONTEXT (f));
-	  if (src != NULL)
-	    {
-	      cairo_set_source_surface (cr, src, 0, 0);
-	      cairo_paint (cr);
-	    }
-#endif
-	}
+  /* If no surface yet, just clear and return.  */
+  if (!skia_surface)
+    {
+      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+      cairo_set_source_rgb (cr, RED_FROM_ULONG (bg) / 255.0,
+			    GREEN_FROM_ULONG (bg) / 255.0,
+			    BLUE_FROM_ULONG (bg) / 255.0);
+      cairo_paint (cr);
+      return FALSE;
     }
+
+  emacs_skia_surface_flush (skia_surface);
+
+  /* For raster surfaces, blit pixels directly.  */
+  void *pixels = emacs_skia_surface_get_pixels (skia_surface);
+  if (pixels)
+    {
+      int width = emacs_skia_surface_get_width (skia_surface);
+      int height = emacs_skia_surface_get_height (skia_surface);
+      cairo_surface_t *skia_cairo_surface
+	= cairo_image_surface_create_for_data (pixels, CAIRO_FORMAT_ARGB32,
+					       width, height, width * 4);
+      cairo_set_source_surface (cr, skia_cairo_surface, 0, 0);
+      cairo_paint (cr);
+      cairo_surface_destroy (skia_cairo_surface);
+    }
+#else /* USE_CAIRO */
+  cairo_surface_t *src = NULL;
+  src = FRAME_X_OUTPUT (f)->cr_surface_visible_bell;
+  if (src == NULL && FRAME_CR_ACTIVE_CONTEXT (f) != NULL)
+    src = cairo_get_target (FRAME_CR_ACTIVE_CONTEXT (f));
+  if (src != NULL)
+    {
+      cairo_set_source_surface (cr, src, 0, 0);
+      cairo_paint (cr);
+    }
+#endif
   return FALSE;
 }
 
@@ -6062,11 +6239,20 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
   if (f)
     {
       xg_frame_resized (f, alloc->width, alloc->height);
-      pgtk_cr_update_surface_desired_size (f, alloc->width,
-					   alloc->height, false);
 #ifdef USE_SKIA
+#  ifdef SK_GL
+      /* Resize the GtkGLArea to fill the frame.  */
+      if (FRAME_GL_AREA (f))
+	{
+	  gtk_widget_set_size_request (FRAME_GL_AREA (f),
+				       alloc->width, alloc->height);
+	}
+#  endif
       pgtk_skia_update_surface_desired_size (f, alloc->width,
 					     alloc->height, false);
+#else
+      pgtk_cr_update_surface_desired_size (f, alloc->width,
+					   alloc->height, false);
 #endif
     }
 }
@@ -7790,7 +7976,15 @@ pgtk_monitors_changed_cb (GdkScreen *screen, gpointer user_data)
 
 static gboolean pgtk_selection_event (GtkWidget *, GdkEvent *,
 				      gpointer);
-
+
+#if defined (USE_SKIA) && defined (SK_GL)
+/* Forward declarations for GtkGLArea callbacks.  */
+static void pgtk_gl_area_realize (GtkGLArea *, gpointer);
+static gboolean pgtk_gl_area_render (GtkGLArea *, GdkGLContext *, gpointer);
+static void pgtk_gl_area_resize (GtkGLArea *, gint, gint, gpointer);
+static bool pgtk_setup_gl_framebuffer (struct frame *, int, int);
+#endif
+
 void
 pgtk_set_event_handler (struct frame *f)
 {
@@ -7862,8 +8056,42 @@ pgtk_set_event_handler (struct frame *f)
 		    G_CALLBACK (drag_motion), NULL);
   g_signal_connect (G_OBJECT (FRAME_GTK_WIDGET (f)), "drag-drop",
 		    G_CALLBACK (drag_drop), NULL);
+
+#if defined (USE_SKIA) && defined (SK_GL)
+  /* For Skia GL rendering, create a GtkGLArea widget.  */
+  {
+    GtkWidget *gl_area = gtk_gl_area_new ();
+    FRAME_GL_AREA (f) = gl_area;
+
+    /* Request OpenGL 3.2 core profile for Skia compatibility.  */
+    gtk_gl_area_set_required_version (GTK_GL_AREA (gl_area), 3, 2);
+    gtk_gl_area_set_has_depth_buffer (GTK_GL_AREA (gl_area), FALSE);
+    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), FALSE);
+    gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
+
+    /* Connect GtkGLArea signals.  */
+    g_signal_connect (G_OBJECT (gl_area), "realize",
+		      G_CALLBACK (pgtk_gl_area_realize), f);
+    g_signal_connect (G_OBJECT (gl_area), "render",
+		      G_CALLBACK (pgtk_gl_area_render), f);
+    g_signal_connect (G_OBJECT (gl_area), "resize",
+		      G_CALLBACK (pgtk_gl_area_resize), f);
+
+    /* Add GtkGLArea to the GtkFixed at position (0,0).  */
+    gtk_fixed_put (GTK_FIXED (FRAME_GTK_WIDGET (f)), gl_area, 0, 0);
+
+    /* Make it fill the entire frame.  This will be updated on resize.  */
+    gtk_widget_set_size_request (gl_area, 1, 1);
+    gtk_widget_set_hexpand (gl_area, TRUE);
+    gtk_widget_set_vexpand (gl_area, TRUE);
+    gtk_widget_show (gl_area);
+  }
+#else
+  /* For non-GL rendering (Cairo or Skia raster), use the draw callback.  */
   g_signal_connect (G_OBJECT (FRAME_GTK_WIDGET (f)), "draw",
 		    G_CALLBACK (pgtk_handle_draw), NULL);
+#endif
+
   g_signal_connect (G_OBJECT (FRAME_GTK_WIDGET (f)),
 		    "property-notify-event",
 		    G_CALLBACK (pgtk_selection_event), NULL);
@@ -8468,6 +8696,321 @@ pgtk_clear_area (struct frame *f, int x, int y, int width, int height)
    Skia drawing functions
    ============================================================ */
 
+# ifdef SK_GL
+/* GtkGLArea "realize" callback - set up GL resources.  */
+static void
+pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
+{
+  struct frame *f = (struct frame *) user_data;
+
+  /* Make the GtkGLArea's context current.  */
+  gtk_gl_area_make_current (gl_area);
+
+  GError *gl_error = gtk_gl_area_get_error (gl_area);
+  if (gl_error != NULL)
+    return;
+
+  /* Get the GDK GL context from GtkGLArea.  */
+  GdkGLContext *gl_context = gtk_gl_area_get_context (gl_area);
+  if (!gl_context)
+    return;
+
+  FRAME_GDK_GL_CONTEXT (f) = gl_context;
+
+  /* Create Skia GL context using the native GL interface.  */
+  FRAME_SKIA_GL_CONTEXT (f) = emacs_skia_gl_context_create_native ();
+
+  if (!FRAME_SKIA_GL_CONTEXT (f))
+    {
+      FRAME_GDK_GL_CONTEXT (f) = NULL;
+      return;
+    }
+
+  /* Create GL framebuffer and texture for offscreen rendering.  */
+  glGenFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+  glGenTextures (1, &FRAME_GL_TEXTURE (f));
+
+  FRAME_SKIA_GL_INITIALIZED (f) = true;
+
+  /* Get the initial size and set up the FBO.  */
+  GtkAllocation alloc;
+  gtk_widget_get_allocation (GTK_WIDGET (gl_area), &alloc);
+  if (alloc.width > 0 && alloc.height > 0)
+    {
+      pgtk_setup_gl_framebuffer (f, alloc.width, alloc.height);
+      FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = alloc.width;
+      FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = alloc.height;
+    }
+}
+
+/* GtkGLArea "render" callback - blit FBO to screen.  */
+static gboolean
+pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
+		     gpointer user_data)
+{
+  struct frame *f = (struct frame *) user_data;
+  emacs_skia_surface_t *skia_surface;
+
+  /* Use visible bell surface if active, otherwise main surface.  */
+  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
+    skia_surface = FRAME_X_OUTPUT (f)->skia_surface_visible_bell;
+  else
+    skia_surface = FRAME_SKIA_SURFACE (f);
+
+  if (!skia_surface || !FRAME_GL_FRAMEBUFFER (f))
+    {
+      /* No surface yet, clear to background color.  */
+      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+      float r = RED_FROM_ULONG (bg) / 255.0f;
+      float g = GREEN_FROM_ULONG (bg) / 255.0f;
+      float b = BLUE_FROM_ULONG (bg) / 255.0f;
+      glClearColor (r, g, b, 1.0f);
+      glClear (GL_COLOR_BUFFER_BIT);
+      return TRUE;
+    }
+
+  /* Ensure GtkGLArea's buffers are attached.  */
+  gtk_gl_area_attach_buffers (gl_area);
+
+  /* Flush Skia rendering to ensure FBO has latest content.  */
+  emacs_skia_surface_flush (skia_surface);
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+
+  /* Ensure all GL commands from Skia are complete before blitting.  */
+  glFinish ();
+
+  int src_width = emacs_skia_surface_get_width (skia_surface);
+  int src_height = emacs_skia_surface_get_height (skia_surface);
+
+  /* Get the actual viewport size (may differ due to HiDPI).  */
+  GLint viewport[4];
+  glGetIntegerv (GL_VIEWPORT, viewport);
+  int dst_width = viewport[2];
+  int dst_height = viewport[3];
+
+  /* Disable blending for opaque blit.  */
+  glDisable (GL_BLEND);
+  glDisable (GL_SCISSOR_TEST);
+
+  /* Bind our FBO as the read framebuffer.  The GtkGLArea's FBO is
+     already bound as the draw framebuffer.  */
+  glBindFramebuffer (GL_READ_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+
+  /* Blit the FBO to GtkGLArea's framebuffer.  Both FBOs use the same
+     OpenGL coordinate system (origin at bottom-left), so no Y-flip
+     is needed.  */
+  glBlitFramebuffer (0, 0, src_width, src_height,
+		     0, 0, dst_width, dst_height,
+		     GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+  /* Check for GL errors (silently ignore).  */
+  glGetError ();
+
+  /* Restore framebuffer bindings.  */
+  glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
+
+  return TRUE;
+}
+
+/* GtkGLArea "resize" callback - resize FBO to match widget.  */
+static void
+pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
+		     gpointer user_data)
+{
+  struct frame *f = (struct frame *) user_data;
+
+  if (width <= 0 || height <= 0)
+    return;
+
+  /* Make context current before GL operations.  */
+  gtk_gl_area_make_current (gl_area);
+
+  /* Destroy the old Skia surface if size changed.  The surface will
+     be recreated on next draw with the new size.  */
+  if (FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) != width
+      || FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) != height)
+    {
+      /* Destroy only the Skia surface, keep the GL context.  */
+      if (FRAME_SKIA_SURFACE (f))
+	{
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    {
+	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	      glFinish ();
+	    }
+	  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+	  FRAME_SKIA_SURFACE (f) = NULL;
+	  FRAME_SKIA_CANVAS (f) = NULL;
+	}
+
+      /* Resize the FBO texture.  */
+      if (FRAME_GL_FRAMEBUFFER (f))
+	pgtk_setup_gl_framebuffer (f, width, height);
+
+      FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
+      FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
+
+      /* Mark the frame as needing a full redraw.  */
+      SET_FRAME_GARBAGED (f);
+    }
+}
+
+/* Create and set up GL context for frame F (fallback when no GtkGLArea).  */
+static bool
+pgtk_init_gl_area (struct frame *f)
+{
+  GtkWidget *fixed;
+  GdkWindow *gdk_window;
+  GdkGLContext *gl_context;
+  GError *error = NULL;
+
+  if (FRAME_GDK_GL_CONTEXT (f))
+    return true; /* Already initialized.  */
+
+  fixed = FRAME_GTK_WIDGET (f);
+
+  /* Make the fixed widget app-paintable so it doesn't draw background.  */
+  gtk_widget_set_app_paintable (fixed, TRUE);
+
+  /* Get the GdkWindow from the widget.  */
+  gdk_window = gtk_widget_get_window (fixed);
+  if (!gdk_window)
+    return false;
+
+  /* Create a GL context directly from the GdkWindow.  */
+  gl_context = gdk_window_create_gl_context (gdk_window, &error);
+  if (!gl_context)
+    {
+      if (error)
+	g_error_free (error);
+      return false;
+    }
+
+  /* Realize the context (required before use).  */
+  if (!gdk_gl_context_realize (gl_context, &error))
+    {
+      if (error)
+	g_error_free (error);
+      g_object_unref (gl_context);
+      return false;
+    }
+
+  FRAME_GDK_GL_CONTEXT (f) = gl_context;
+
+  /* Make the context current.  */
+  gdk_gl_context_make_current (gl_context);
+
+  /* Create Skia GL context using the native GL interface.  */
+  FRAME_SKIA_GL_CONTEXT (f) = emacs_skia_gl_context_create_native ();
+
+  if (!FRAME_SKIA_GL_CONTEXT (f))
+    {
+      g_object_unref (gl_context);
+      FRAME_GDK_GL_CONTEXT (f) = NULL;
+      return false;
+    }
+
+  /* Create GL framebuffer and texture for offscreen rendering.  */
+  glGenFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+  glGenTextures (1, &FRAME_GL_TEXTURE (f));
+
+  FRAME_SKIA_GL_INITIALIZED (f) = true;
+  /* No GtkGLArea - we use direct GdkGLContext.  */
+  FRAME_GL_AREA (f) = NULL;
+
+  return true;
+}
+
+/* Legacy init function - now just calls pgtk_init_gl_area.  */
+static bool
+pgtk_init_gl_context (struct frame *f)
+{
+  if (FRAME_SKIA_GL_INITIALIZED (f))
+    return FRAME_GDK_GL_CONTEXT (f) != NULL;
+
+  return pgtk_init_gl_area (f);
+}
+
+/* Set up GL framebuffer for rendering at given size.  */
+static bool
+pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
+{
+  if (!FRAME_GDK_GL_CONTEXT (f))
+    return false;
+
+  /* Make the GL context current.  */
+  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+  /* Bind and configure the texture.  */
+  glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
+  glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+		GL_UNSIGNED_BYTE, NULL);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+  /* Bind the framebuffer and attach the texture.  */
+  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+  glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			  GL_TEXTURE_2D, FRAME_GL_TEXTURE (f), 0);
+
+  GLenum status = glCheckFramebufferStatus (GL_FRAMEBUFFER);
+  if (status != GL_FRAMEBUFFER_COMPLETE)
+    return false;
+
+  /* Clear the FBO to black initially to avoid garbage data.
+     The actual background color will be set when Skia draws.  */
+  glClearColor (0.0f, 0.0f, 0.0f, 1.0f);
+  glClear (GL_COLOR_BUFFER_BIT);
+  glFinish ();
+
+  /* Unbind the framebuffer.  */
+  glBindFramebuffer (GL_FRAMEBUFFER, 0);
+
+  return true;
+}
+
+/* Clean up GL resources for frame F.  */
+static void
+pgtk_cleanup_gl_context (struct frame *f)
+{
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    {
+      emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
+      FRAME_SKIA_GL_CONTEXT (f) = NULL;
+    }
+
+  if (FRAME_GDK_GL_CONTEXT (f))
+    {
+      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+      if (FRAME_GL_FRAMEBUFFER (f))
+	{
+	  glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+	  FRAME_GL_FRAMEBUFFER (f) = 0;
+	}
+      if (FRAME_GL_TEXTURE (f))
+	{
+	  glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
+	  FRAME_GL_TEXTURE (f) = 0;
+	}
+
+      /* We created this context ourselves, so unref it.  */
+      gdk_gl_context_clear_current ();
+      g_object_unref (FRAME_GDK_GL_CONTEXT (f));
+      FRAME_GDK_GL_CONTEXT (f) = NULL;
+    }
+
+  /* No GtkGLArea to destroy - we use direct GdkGLContext.  */
+  FRAME_GL_AREA (f) = NULL;
+
+  FRAME_SKIA_GL_INITIALIZED (f) = false;
+}
+# endif /* SK_GL */
+
+/* Forward declaration.  */
+static void pgtk_skia_destroy_surface_only (struct frame *f);
+
 void
 pgtk_skia_update_surface_desired_size (struct frame *f, int width,
 				       int height, bool force)
@@ -8475,7 +9018,10 @@ pgtk_skia_update_surface_desired_size (struct frame *f, int width,
   if (FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) != width
       || FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) != height || force)
     {
-      pgtk_skia_destroy_frame_context (f);
+      /* Only destroy the Skia surface, preserve the GtkGLArea and GL
+	 context.  This avoids recreating the entire GL setup on every
+	 resize, which causes flickering.  */
+      pgtk_skia_destroy_surface_only (f);
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
       SET_FRAME_GARBAGED (f);
@@ -8489,8 +9035,6 @@ pgtk_begin_skia_clip (struct frame *f)
 
   if (!canvas)
     {
-      /* Create a raster surface for now.  Later we can add GL
-       * support.  */
       int width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
       int height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
 
@@ -8499,8 +9043,51 @@ pgtk_begin_skia_clip (struct frame *f)
       if (height <= 0)
 	height = 1;
 
-      FRAME_SKIA_SURFACE (f)
-	= emacs_skia_surface_create_raster (width, height);
+# ifdef SK_GL
+      /* Use GtkGLArea's context if available.  */
+      if (FRAME_GL_AREA (f) && FRAME_GDK_GL_CONTEXT (f))
+	{
+	  /* Make the GtkGLArea's context current.  */
+	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
+
+	  /* Set up FBO if not already done.  */
+	  if (!FRAME_GL_FRAMEBUFFER (f))
+	    pgtk_setup_gl_framebuffer (f, width, height);
+
+	  /* Create Skia surface if needed.  */
+	  if (!FRAME_SKIA_SURFACE (f) && FRAME_GL_FRAMEBUFFER (f))
+	    {
+	      FRAME_SKIA_SURFACE (f)
+		= emacs_skia_surface_create_gl (FRAME_SKIA_GL_CONTEXT (f),
+						width, height,
+						FRAME_GL_FRAMEBUFFER (f),
+						GL_RGBA8);
+	    }
+	}
+      /* Fallback: create offscreen GL context if no GtkGLArea.  */
+      else if (pgtk_init_gl_context (f)
+	       && pgtk_setup_gl_framebuffer (f, width, height))
+	{
+	  /* Make GL context current.  */
+	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  FRAME_SKIA_SURFACE (f)
+	    = emacs_skia_surface_create_gl (FRAME_SKIA_GL_CONTEXT (f),
+					    width, height,
+					    FRAME_GL_FRAMEBUFFER (f),
+					    GL_RGBA8);
+	}
+
+      if (!FRAME_SKIA_SURFACE (f))
+	{
+	  /* Fall back to raster surface.  */
+	  pgtk_cleanup_gl_context (f);
+# endif
+	  FRAME_SKIA_SURFACE (f)
+	    = emacs_skia_surface_create_raster (width, height);
+# ifdef SK_GL
+	}
+# endif
+
       if (!FRAME_SKIA_SURFACE (f))
 	return NULL;
 
@@ -8510,7 +9097,48 @@ pgtk_begin_skia_clip (struct frame *f)
       /* Create a reusable paint object.  */
       if (!FRAME_SKIA_PAINT (f))
 	FRAME_SKIA_PAINT (f) = emacs_skia_paint_create ();
+
+      /* Clear the newly created surface with the background color.
+	 This is critical for GL surfaces where the FBO starts with
+	 undefined contents.  Without this, the first readback may
+	 show garbage data causing flickering.  */
+      {
+	unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+	Emacs_Color col;
+	col.pixel = bg;
+	pgtk_query_color (f, &col);
+	uint8_t r = col.red >> 8;
+	uint8_t g = col.green >> 8;
+	uint8_t b = col.blue >> 8;
+	emacs_skia_canvas_clear (canvas,
+				 EMACS_SKIA_COLOR (255, r, g, b));
+# ifdef SK_GL
+	/* Flush the clear operation for GL surfaces.  */
+	if (FRAME_SKIA_GL_CONTEXT (f))
+	  {
+	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	    glFinish ();
+	  }
+# endif
+      }
     }
+# ifdef SK_GL
+  else if (FRAME_GDK_GL_CONTEXT (f))
+    {
+      /* For GL surfaces, ensure the GL context is current before any
+	 drawing operations.  Skia's GL backend requires this.  */
+      if (FRAME_GL_AREA (f))
+	gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      else
+	gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+      /* Tell Skia to re-query GL state since we switched contexts
+	 externally.  Without this, Skia's cached GL state may be
+	 stale and rendering may go to the wrong target.  */
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+    }
+# endif
 
   emacs_skia_canvas_save (canvas);
 
@@ -8557,8 +9185,10 @@ pgtk_skia_set_paint_color (struct frame *f, unsigned long color,
   emacs_skia_paint_set_color (paint, EMACS_SKIA_COLOR (a, r, g, b));
 }
 
-void
-pgtk_skia_destroy_frame_context (struct frame *f)
+/* Destroy only the Skia surface, preserving GL context and GtkGLArea.
+   Used during resize to avoid recreating the entire GL setup.  */
+static void
+pgtk_skia_destroy_surface_only (struct frame *f)
 {
   if (FRAME_SKIA_PAINT (f))
     {
@@ -8571,15 +9201,51 @@ pgtk_skia_destroy_frame_context (struct frame *f)
 
   if (FRAME_SKIA_SURFACE (f))
     {
+# ifdef SK_GL
+      /* For GL surfaces, make context current and flush before
+	 destroying to ensure any pending operations complete and
+	 the GrDirectContext state is clean.  */
+      if (FRAME_GDK_GL_CONTEXT (f))
+	{
+	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    {
+	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	      glFinish ();
+	    }
+	}
+# endif
       emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
       FRAME_SKIA_SURFACE (f) = NULL;
-    }
 
+# ifdef SK_GL
+      /* Reset the GrDirectContext state after destroying the surface.
+	 This clears Skia's internal caches that may reference the
+	 old surface's backend render target.  */
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	{
+	  emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+	}
+# endif
+    }
+}
+
+void
+pgtk_skia_destroy_frame_context (struct frame *f)
+{
+  pgtk_skia_destroy_surface_only (f);
+
+# ifdef SK_GL
+  /* Clean up GL resources (includes Skia GL context, GDK GL context,
+     and GL framebuffer/texture).  */
+  pgtk_cleanup_gl_context (f);
+# else
   if (FRAME_SKIA_GL_CONTEXT (f))
     {
       emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
       FRAME_SKIA_GL_CONTEXT (f) = NULL;
     }
+# endif
 }
 
 /* Skia version of fill rectangle.  */
@@ -8628,6 +9294,20 @@ pgtk_skia_draw_rectangle (struct frame *f, unsigned long color, int x,
 }
 
 #endif /* USE_SKIA */
+
+#if defined(USE_SKIA) && defined(SK_GL)
+DEFUN ("pgtk-skia-gl-enabled-p", Fpgtk_skia_gl_enabled_p,
+       Spgtk_skia_gl_enabled_p, 0, 1, 0,
+       doc: /* Return non-nil if Skia GL acceleration is active for FRAME.
+If FRAME is nil, use the selected frame.  */)
+(Lisp_Object frame)
+{
+  struct frame *f = decode_window_system_frame (frame);
+  if (FRAME_GDK_GL_CONTEXT (f) && FRAME_SKIA_GL_CONTEXT (f))
+    return Qt;
+  return Qnil;
+}
+#endif
 
 void
 syms_of_pgtkterm (void)
@@ -8719,10 +9399,15 @@ If set to a non-float value, there will be no wait at all.  */);
   window_being_scrolled = Qnil;
   staticpro (&window_being_scrolled);
 
+#if defined(USE_SKIA) && defined(SK_GL)
+  defsubr (&Spgtk_skia_gl_enabled_p);
+#endif
+
   /* Tell Emacs about this window system.  */
   Fprovide (Qpgtk, Qnil);
 }
 
+#ifdef USE_CAIRO
 /* Cairo does not allow resizing a surface/context after it is
    created, so we need to trash the old context, create a new context
    on the next cr_clip_begin with the new dimensions and request a
@@ -8869,7 +9554,7 @@ pgtk_cr_export_frames (Lisp_Object frames,
   height = FRAME_PIXEL_HEIGHT (f);
 
   block_input ();
-#ifdef CAIRO_HAS_PDF_SURFACE
+# ifdef CAIRO_HAS_PDF_SURFACE
   if (surface_type == CAIRO_SURFACE_TYPE_PDF)
     {
       surface = cairo_pdf_surface_create_for_stream (
@@ -8877,14 +9562,14 @@ pgtk_cr_export_frames (Lisp_Object frames,
       surface_set_size_func = cairo_pdf_surface_set_size;
     }
   else
-#endif
-#ifdef CAIRO_HAS_PNG_FUNCTIONS
+# endif
+# ifdef CAIRO_HAS_PNG_FUNCTIONS
     if (surface_type == CAIRO_SURFACE_TYPE_IMAGE)
     surface = cairo_image_surface_create (CAIRO_FORMAT_RGB24, width,
 					  height);
   else
-#endif
-#ifdef CAIRO_HAS_PS_SURFACE
+# endif
+# ifdef CAIRO_HAS_PS_SURFACE
     if (surface_type == CAIRO_SURFACE_TYPE_PS)
     {
       surface
@@ -8893,14 +9578,14 @@ pgtk_cr_export_frames (Lisp_Object frames,
       surface_set_size_func = cairo_ps_surface_set_size;
     }
   else
-#endif
-#ifdef CAIRO_HAS_SVG_SURFACE
+# endif
+# ifdef CAIRO_HAS_SVG_SURFACE
     if (surface_type == CAIRO_SURFACE_TYPE_SVG)
     surface
       = cairo_svg_surface_create_for_stream (pgtk_cr_accumulate_data,
 					     &acc, width, height);
   else
-#endif
+# endif
     abort ();
 
   cr = cairo_create (surface);
@@ -8931,7 +9616,7 @@ pgtk_cr_export_frames (Lisp_Object frames,
       block_input ();
     }
 
-#ifdef CAIRO_HAS_PNG_FUNCTIONS
+# ifdef CAIRO_HAS_PNG_FUNCTIONS
   if (surface_type == CAIRO_SURFACE_TYPE_IMAGE)
     {
       cairo_surface_flush (surface);
@@ -8939,13 +9624,14 @@ pgtk_cr_export_frames (Lisp_Object frames,
 					 pgtk_cr_accumulate_data,
 					 &acc);
     }
-#endif
+# endif
   unblock_input ();
 
   unbind_to (count, Qnil);
 
   return CALLN (Fapply, Qconcat, Fnreverse (acc));
 }
+#endif /* USE_CAIRO */
 
 #ifdef USE_SKIA
 /* Skia-based frame export.

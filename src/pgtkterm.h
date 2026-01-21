@@ -443,7 +443,7 @@ struct pgtk_output
   cairo_surface_t *cr_surface_visible_bell;
 # endif
 # ifdef USE_SKIA
-  /* Cairo drawing contexts (used as bridge for Skia to GTK).  */
+  /* Cairo contexts for PDF/SVG export and compatibility functions. */
   cairo_t *cr_context, *cr_active;
   int cr_surface_desired_width, cr_surface_desired_height;
   /* Skia drawing contexts.  */
@@ -453,6 +453,26 @@ struct pgtk_output
   int skia_surface_desired_width, skia_surface_desired_height;
   emacs_skia_paint_t *skia_paint; /* Reusable paint object */
   emacs_skia_surface_t *skia_surface_visible_bell;
+#  ifdef SK_GL
+  /* GDK GL context for GPU-accelerated rendering.  */
+  GdkGLContext *gdk_gl_context;
+  /* GL framebuffer object and texture for offscreen rendering.  */
+  unsigned int gl_framebuffer;
+  unsigned int gl_texture;
+  /* GtkGLArea widget for direct GL rendering (no Cairo).  */
+  GtkWidget *gl_area;
+  /* Track if GL initialization succeeded.  */
+  bool skia_gl_initialized;
+  /* Pixel Buffer Objects for async readback.  */
+  unsigned int pbo[2];
+  int pbo_index;	     /* Which PBO to write to (ping-pong).  */
+  int pbo_width, pbo_height; /* Size of allocated PBOs.  */
+  unsigned char
+    *pbo_mapped; /* Mapped PBO data from previous frame.  */
+  /* Frame pacing.  */
+  int64_t
+    last_render_time_us; /* Last render timestamp in microseconds.  */
+#  endif
 # endif
   struct atimer *atimer_visible_bell;
 
@@ -584,6 +604,23 @@ enum
     ((f)->output_data.pgtk->skia_surface_desired_width)
 #  define FRAME_SKIA_SURFACE_DESIRED_HEIGHT(f) \
     ((f)->output_data.pgtk->skia_surface_desired_height)
+#  ifdef SK_GL
+#   define FRAME_GDK_GL_CONTEXT(f) \
+     ((f)->output_data.pgtk->gdk_gl_context)
+#   define FRAME_GL_FRAMEBUFFER(f) \
+     ((f)->output_data.pgtk->gl_framebuffer)
+#   define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
+#   define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
+#   define FRAME_SKIA_GL_INITIALIZED(f) \
+     ((f)->output_data.pgtk->skia_gl_initialized)
+#   define FRAME_GL_PBO(f, i) ((f)->output_data.pgtk->pbo[i])
+#   define FRAME_GL_PBO_INDEX(f) ((f)->output_data.pgtk->pbo_index)
+#   define FRAME_GL_PBO_WIDTH(f) ((f)->output_data.pgtk->pbo_width)
+#   define FRAME_GL_PBO_HEIGHT(f) ((f)->output_data.pgtk->pbo_height)
+#   define FRAME_GL_PBO_MAPPED(f) ((f)->output_data.pgtk->pbo_mapped)
+#   define FRAME_LAST_RENDER_TIME(f) \
+     ((f)->output_data.pgtk->last_render_time_us)
+#  endif
 # endif
 
 /* If a struct input_event has a kind which is SELECTION_REQUEST_EVENT

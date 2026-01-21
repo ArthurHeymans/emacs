@@ -158,10 +158,18 @@ extern "C"
   emacs_skia_gl_context_create (emacs_skia_gl_get_proc_fn get_proc,
 				void *ctx);
 
+  /* Create a GL context using the native GL interface.  This uses
+     the currently active GL context (e.g., set by GDK).  */
+  emacs_skia_gl_context_t *emacs_skia_gl_context_create_native (void);
+
   void emacs_skia_gl_context_destroy (emacs_skia_gl_context_t *ctx);
 
   /* Flush pending GPU operations */
   void emacs_skia_gl_context_flush (emacs_skia_gl_context_t *ctx);
+
+  /* Reset the GL context state tracking.  Call this after destroying
+     a GL surface to clear Skia's internal caches.  */
+  void emacs_skia_gl_context_reset (emacs_skia_gl_context_t *ctx);
 
   /* ============================================================
      Surface

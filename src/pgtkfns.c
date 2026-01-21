@@ -1183,9 +1183,15 @@ update_watched_scale_factor (struct atimer *timer)
   if (scale_factor != FRAME_X_OUTPUT (f)->watched_scale_factor)
     {
       FRAME_X_OUTPUT (f)->watched_scale_factor = scale_factor;
+#ifdef USE_SKIA
+      pgtk_skia_update_surface_desired_size (
+	f, FRAME_SKIA_SURFACE_DESIRED_WIDTH (f),
+	FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f), true);
+#else
       pgtk_cr_update_surface_desired_size (
 	f, FRAME_CR_SURFACE_DESIRED_WIDTH (f),
 	FRAME_CR_SURFACE_DESIRED_HEIGHT (f), true);
+#endif
     }
 }
 
@@ -3414,7 +3420,11 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
 
   unblock_input ();
 
+#ifdef USE_SKIA
+  pgtk_skia_update_surface_desired_size (tip_f, width, height, false);
+#else
   pgtk_cr_update_surface_desired_size (tip_f, width, height, false);
+#endif
 
   w->must_be_updated_p = true;
   update_single_window (w);

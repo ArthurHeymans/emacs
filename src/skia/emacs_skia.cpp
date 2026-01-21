@@ -63,13 +63,13 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 #endif
 
 #ifdef SK_GL
-# include "gpu/GrBackendSurface.h"
-# include "gpu/GrDirectContext.h"
+# include "gpu/ganesh/GrBackendSurface.h"
+# include "gpu/ganesh/GrDirectContext.h"
 # include "gpu/ganesh/SkSurfaceGanesh.h"
+# include "gpu/ganesh/gl/GrGLAssembleInterface.h"
 # include "gpu/ganesh/gl/GrGLBackendSurface.h"
 # include "gpu/ganesh/gl/GrGLDirectContext.h"
-# include "gpu/gl/GrGLAssembleInterface.h"
-# include "gpu/gl/GrGLInterface.h"
+# include "gpu/ganesh/gl/GrGLInterface.h"
 #endif
 
 /* ============================================================
@@ -80,6 +80,9 @@ struct emacs_skia_surface
 {
   sk_sp<SkSurface> surface;
   void *pixels; /* For raster surfaces with external pixels */
+#ifdef SK_GL
+  GrDirectContext *context; /* For GPU surfaces, to flush */
+#endif
 };
 
 struct emacs_skia_canvas
@@ -258,6 +261,67 @@ emacs_skia_cleanup (void)
    GL Context
    ============================================================ */
 
+/* Create GL context using the native GL interface.  This uses the
+   currently active GL context (e.g., set by GDK).  */
+/* Callback for GrGLMakeAssembledInterface to get GL function
+   pointers. We use dlsym on libGL.so which works for both GLX and EGL
+   contexts when the context is already current.  */
+#ifdef SK_GL
+# include <dlfcn.h>
+
+static void *gl_lib_handle = nullptr;
+
+static GrGLFuncPtr
+get_gl_proc (void *ctx, const char *name)
+{
+  (void) ctx;
+
+  /* Lazy-load libGL.so */
+  if (!gl_lib_handle)
+    {
+      gl_lib_handle = dlopen ("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+      if (!gl_lib_handle)
+	gl_lib_handle = dlopen ("libGL.so", RTLD_LAZY | RTLD_GLOBAL);
+      if (!gl_lib_handle)
+	{
+	  /* Try EGL/GLES for Wayland */
+	  gl_lib_handle
+	    = dlopen ("libGLESv2.so.2", RTLD_LAZY | RTLD_GLOBAL);
+	  if (!gl_lib_handle)
+	    gl_lib_handle
+	      = dlopen ("libGLESv2.so", RTLD_LAZY | RTLD_GLOBAL);
+	}
+    }
+
+  if (!gl_lib_handle)
+    return nullptr;
+
+  return (GrGLFuncPtr) dlsym (gl_lib_handle, name);
+}
+#endif
+
+emacs_skia_gl_context_t *
+emacs_skia_gl_context_create_native (void)
+{
+#ifdef SK_GL
+  /* Use GrGLMakeAssembledInterface with our dlsym-based function
+   * loader.  */
+  auto interface = GrGLMakeAssembledInterface (nullptr, get_gl_proc);
+  if (!interface)
+    return nullptr;
+
+  auto grContext = GrDirectContexts::MakeGL (interface);
+  if (!grContext)
+    return nullptr;
+
+  auto result = new emacs_skia_gl_context_t;
+  result->context = grContext;
+  return result;
+#else
+  return nullptr;
+#endif
+}
+
 #ifdef SK_GL
 emacs_skia_gl_context_t *
 emacs_skia_gl_context_create (emacs_skia_gl_get_proc_fn get_proc,
@@ -266,15 +330,11 @@ emacs_skia_gl_context_create (emacs_skia_gl_get_proc_fn get_proc,
   auto interface = GrGLMakeAssembledInterface (ctx, (GrGLGetProc)
 						      get_proc);
   if (!interface)
-    {
-      return nullptr;
-    }
+    return nullptr;
 
   auto grContext = GrDirectContexts::MakeGL (interface);
   if (!grContext)
-    {
-      return nullptr;
-    }
+    return nullptr;
 
   auto result = new emacs_skia_gl_context_t;
   result->context = grContext;
@@ -295,8 +355,20 @@ void
 emacs_skia_gl_context_flush (emacs_skia_gl_context_t *ctx)
 {
   if (ctx && ctx->context)
+    ctx->context->flushAndSubmit ();
+}
+
+void
+emacs_skia_gl_context_reset (emacs_skia_gl_context_t *ctx)
+{
+  if (ctx && ctx->context)
     {
-      ctx->context->flushAndSubmit ();
+      /* Reset Skia's internal GL state tracking.  This is needed
+	 after destroying a surface that was wrapped around a backend
+	 render target, as Skia may have cached state related to that
+	 target. resetContext() tells Skia to re-query GL state on
+	 next use.  */
+      ctx->context->resetContext ();
     }
 }
 #else
@@ -320,6 +392,12 @@ emacs_skia_gl_context_flush (emacs_skia_gl_context_t *ctx)
 {
   (void) ctx;
 }
+
+void
+emacs_skia_gl_context_reset (emacs_skia_gl_context_t *ctx)
+{
+  (void) ctx;
+}
 #endif
 
 /* ============================================================
@@ -339,6 +417,9 @@ emacs_skia_surface_create_raster (int width, int height)
   auto result = new emacs_skia_surface_t;
   result->surface = surface;
   result->pixels = nullptr;
+#ifdef SK_GL
+  result->context = nullptr;
+#endif
   return result;
 }
 
@@ -349,9 +430,7 @@ emacs_skia_surface_create_gl (emacs_skia_gl_context_t *ctx, int width,
 			      unsigned int format)
 {
   if (!ctx || !ctx->context)
-    {
-      return nullptr;
-    }
+    return nullptr;
 
   GrGLFramebufferInfo fbInfo;
   fbInfo.fFBOID = framebuffer_id;
@@ -367,13 +446,12 @@ emacs_skia_surface_create_gl (emacs_skia_gl_context_t *ctx, int width,
 			     nullptr);
 
   if (!surface)
-    {
-      return nullptr;
-    }
+    return nullptr;
 
   auto result = new emacs_skia_surface_t;
   result->surface = surface;
   result->pixels = nullptr;
+  result->context = ctx->context.get ();
   return result;
 }
 #else
@@ -405,6 +483,9 @@ emacs_skia_surface_create_from_pixels (int width, int height,
   auto result = new emacs_skia_surface_t;
   result->surface = surface;
   result->pixels = pixels;
+#ifdef SK_GL
+  result->context = nullptr;
+#endif
   return result;
 }
 
@@ -668,14 +749,6 @@ emacs_skia_canvas_draw_glyphs (emacs_skia_canvas_t *canvas, int count,
       || !paint)
     {
       return;
-    }
-
-  /* Debug: Check clip bounds when drawing near bottom */
-  if (origin.y > 1300)
-    {
-      SkRect clip_bounds = canvas->canvas->getLocalClipBounds ();
-      fprintf (stderr, "DRAWGLYPH: y=%.0f clip_bottom=%.0f\n",
-	       origin.y, clip_bounds.bottom ());
     }
 
   /* Convert positions to SkPoint array */

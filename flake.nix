@@ -28,6 +28,7 @@
             freetype
             libGL
             libGLU
+            libepoxy # GL function loading (used by GTK3 and for Skia GL backend)
             xorg.libX11
             xorg.libXext
             harfbuzz
@@ -46,7 +47,7 @@
             gtk3
             glib
             gdk-pixbuf
-            cairo
+   #         cairo
             pango
             librsvg
             giflib
