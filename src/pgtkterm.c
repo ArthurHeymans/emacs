@@ -8758,9 +8758,9 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   else
     skia_surface = FRAME_SKIA_SURFACE (f);
 
-  if (!skia_surface || !FRAME_GL_FRAMEBUFFER (f))
+  /* No FBO at all - just clear to background.  */
+  if (!FRAME_GL_FRAMEBUFFER (f))
     {
-      /* No surface yet, clear to background color.  */
       unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
       float r = RED_FROM_ULONG (bg) / 255.0f;
       float g = GREEN_FROM_ULONG (bg) / 255.0f;
@@ -8773,16 +8773,34 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   /* Ensure GtkGLArea's buffers are attached.  */
   gtk_gl_area_attach_buffers (gl_area);
 
-  /* Flush Skia rendering to ensure FBO has latest content.  */
-  emacs_skia_surface_flush (skia_surface);
-  if (FRAME_SKIA_GL_CONTEXT (f))
-    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+  /* Flush Skia rendering if we have an active surface.  */
+  if (skia_surface)
+    {
+      emacs_skia_surface_flush (skia_surface);
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+      glFinish ();
+    }
 
-  /* Ensure all GL commands from Skia are complete before blitting.  */
-  glFinish ();
-
-  int src_width = emacs_skia_surface_get_width (skia_surface);
-  int src_height = emacs_skia_surface_get_height (skia_surface);
+  /* Get source dimensions from Skia surface if available, otherwise
+     from the FBO texture (for resize case where surface is destroyed
+     but FBO has preserved content).  */
+  int src_width, src_height;
+  if (skia_surface)
+    {
+      src_width = emacs_skia_surface_get_width (skia_surface);
+      src_height = emacs_skia_surface_get_height (skia_surface);
+    }
+  else
+    {
+      /* Query FBO texture size directly.  */
+      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
+      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+				&src_width);
+      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+				&src_height);
+      glBindTexture (GL_TEXTURE_2D, 0);
+    }
 
   /* Get the actual viewport size (may differ due to HiDPI).  */
   GLint viewport[4];
@@ -8812,6 +8830,63 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
 
   return TRUE;
+}
+
+/* Resize FBO while preserving existing content.  This blits the old
+   content to a temp buffer, resizes the main FBO, clears to background,
+   and blits the preserved content back.  */
+static void
+pgtk_resize_fbo_preserve_content (struct frame *f, int old_width,
+				  int old_height, int new_width,
+				  int new_height)
+{
+  /* Create a temporary FBO to hold the old content.  */
+  GLuint temp_fbo, temp_texture;
+  glGenFramebuffers (1, &temp_fbo);
+  glGenTextures (1, &temp_texture);
+
+  /* Copy old texture to temp texture.  */
+  glBindTexture (GL_TEXTURE_2D, temp_texture);
+  glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, old_width, old_height,
+		0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  glBindFramebuffer (GL_FRAMEBUFFER, temp_fbo);
+  glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			  GL_TEXTURE_2D, temp_texture, 0);
+
+  /* Blit old content to temp.  */
+  glBindFramebuffer (GL_READ_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+  glBindFramebuffer (GL_DRAW_FRAMEBUFFER, temp_fbo);
+  glBlitFramebuffer (0, 0, old_width, old_height,
+		     0, 0, old_width, old_height,
+		     GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+  /* Resize main FBO to new size.  */
+  pgtk_setup_gl_framebuffer (f, new_width, new_height);
+
+  /* Clear new FBO to background color first.  */
+  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+  float r = RED_FROM_ULONG (bg) / 255.0f;
+  float g = GREEN_FROM_ULONG (bg) / 255.0f;
+  float b = BLUE_FROM_ULONG (bg) / 255.0f;
+  glClearColor (r, g, b, 1.0f);
+  glClear (GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+  /* Blit preserved content back.  Use min of old/new dimensions
+     to handle both grow and shrink.  */
+  int blit_width = old_width < new_width ? old_width : new_width;
+  int blit_height = old_height < new_height ? old_height : new_height;
+  glBindFramebuffer (GL_READ_FRAMEBUFFER, temp_fbo);
+  glBindFramebuffer (GL_DRAW_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+  glBlitFramebuffer (0, 0, blit_width, blit_height,
+		     0, 0, blit_width, blit_height,
+		     GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  glFinish ();
+
+  /* Clean up temp resources.  */
+  glDeleteFramebuffers (1, &temp_fbo);
+  glDeleteTextures (1, &temp_texture);
+  glBindFramebuffer (GL_FRAMEBUFFER, 0);
 }
 
 /* GtkGLArea "resize" callback - resize FBO to match widget.  */
@@ -8845,23 +8920,13 @@ pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
 	  FRAME_SKIA_CANVAS (f) = NULL;
 	}
 
-      /* Resize the FBO texture.  */
-      if (FRAME_GL_FRAMEBUFFER (f))
+      /* Resize the FBO texture, preserving existing content.  */
+      if (FRAME_GL_FRAMEBUFFER (f) && FRAME_GL_TEXTURE (f))
 	{
-	  pgtk_setup_gl_framebuffer (f, width, height);
-
-	  /* Clear FBO to background color (not black) so that if GTK
-	     calls render before Emacs redraws, the enlarged area shows
-	     the proper background instead of black.  */
-	  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
-	  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-	  float r = RED_FROM_ULONG (bg) / 255.0f;
-	  float g = GREEN_FROM_ULONG (bg) / 255.0f;
-	  float b = BLUE_FROM_ULONG (bg) / 255.0f;
-	  glClearColor (r, g, b, 1.0f);
-	  glClear (GL_COLOR_BUFFER_BIT);
-	  glFinish ();
-	  glBindFramebuffer (GL_FRAMEBUFFER, 0);
+	  int old_width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
+	  int old_height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+	  pgtk_resize_fbo_preserve_content (f, old_width, old_height,
+					    width, height);
 	}
 
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
@@ -9097,19 +9162,8 @@ pgtk_begin_skia_clip (struct frame *f)
 	      glBindTexture (GL_TEXTURE_2D, 0);
 
 	      if (tex_width != width || tex_height != height)
-		{
-		  pgtk_setup_gl_framebuffer (f, width, height);
-		  /* Clear FBO to background color after resize.  */
-		  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
-		  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-		  float r = RED_FROM_ULONG (bg) / 255.0f;
-		  float g = GREEN_FROM_ULONG (bg) / 255.0f;
-		  float b = BLUE_FROM_ULONG (bg) / 255.0f;
-		  glClearColor (r, g, b, 1.0f);
-		  glClear (GL_COLOR_BUFFER_BIT);
-		  glFinish ();
-		  glBindFramebuffer (GL_FRAMEBUFFER, 0);
-		}
+		pgtk_resize_fbo_preserve_content (f, tex_width, tex_height,
+						  width, height);
 	    }
 
 	  /* Create Skia surface if needed.  */
