@@ -172,6 +172,28 @@ extern "C"
   void emacs_skia_gl_context_reset (emacs_skia_gl_context_t *ctx);
 
   /* ============================================================
+     GL Fence Sync (for async GPU synchronization)
+     ============================================================ */
+
+  /* Opaque fence object for non-blocking GPU synchronization.  */
+  typedef struct emacs_skia_fence emacs_skia_fence_t;
+
+  /* Create a fence that will be signaled when all preceding GL
+     commands have completed on the GPU.  */
+  emacs_skia_fence_t *emacs_skia_fence_create (void);
+
+  /* Wait for fence to be signaled.  Returns true if signaled within
+     timeout_ns nanoseconds, false if timed out.  Pass 0 for no wait
+     (poll), or UINT64_MAX for infinite wait.  */
+  bool emacs_skia_fence_wait (emacs_skia_fence_t *fence, uint64_t timeout_ns);
+
+  /* Check if fence is signaled without waiting.  */
+  bool emacs_skia_fence_is_signaled (emacs_skia_fence_t *fence);
+
+  /* Destroy fence object.  */
+  void emacs_skia_fence_destroy (emacs_skia_fence_t *fence);
+
+  /* ============================================================
      Surface
      ============================================================ */
 

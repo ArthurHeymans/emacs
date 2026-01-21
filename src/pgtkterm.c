@@ -3704,8 +3704,7 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 		cairo_rectangle_t *dst_rect)
 {
 #ifdef USE_SKIA
-  /* Skia version: snapshot the source region and draw to destination.
-   */
+  /* Skia version: snapshot the source region and draw to destination.  */
   emacs_skia_surface_t *skia_surface = FRAME_SKIA_SURFACE (f);
   if (skia_surface)
     {
@@ -8731,6 +8730,9 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
   glGenFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
   glGenTextures (1, &FRAME_GL_TEXTURE (f));
 
+  /* Initialize GL state as dirty so Skia resets on first use.  */
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+
   FRAME_SKIA_GL_INITIALIZED (f) = true;
 
   /* Get the initial size and set up the FBO.  */
@@ -8996,6 +8998,9 @@ pgtk_init_gl_area (struct frame *f)
   glGenFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
   glGenTextures (1, &FRAME_GL_TEXTURE (f));
 
+  /* Initialize GL state as dirty so Skia resets on first use.  */
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+
   FRAME_SKIA_GL_INITIALIZED (f) = true;
   /* No GtkGLArea - we use direct GdkGLContext.  */
   FRAME_GL_AREA (f) = NULL;
@@ -9056,6 +9061,9 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
 
   /* Unbind the framebuffer.  */
   glBindFramebuffer (GL_FRAMEBUFFER, 0);
+
+  /* Mark GL state as dirty so Skia will reset its cached state.  */
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
 
   return true;
 }
@@ -9225,11 +9233,15 @@ pgtk_begin_skia_clip (struct frame *f)
 	emacs_skia_canvas_clear (canvas,
 				 EMACS_SKIA_COLOR (255, r, g, b));
 # ifdef SK_GL
-	/* Flush the clear operation for GL surfaces.  */
+	/* Flush the clear operation for GL surfaces and reset Skia's
+	   GL state tracking since we just set up the GL context.  */
 	if (FRAME_SKIA_GL_CONTEXT (f))
 	  {
 	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 	    glFinish ();
+	    /* Reset Skia state after initial setup.  */
+	    emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+	    FRAME_SKIA_GL_STATE_DIRTY (f) = false;
 	  }
 # endif
       }
@@ -9244,8 +9256,8 @@ pgtk_begin_skia_clip (struct frame *f)
       else
 	gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
-      /* Tell Skia to re-query GL state since we switched contexts
-	 externally.  Without this, Skia's cached GL state may be
+      /* Tell Skia to re-query GL state since GTK/GDK may have modified
+	 it between frames.  Without this, Skia's cached GL state may be
 	 stale and rendering may go to the wrong target.  */
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));

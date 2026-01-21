@@ -71,6 +71,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # include "gpu/ganesh/gl/GrGLBackendSurface.h"
 # include "gpu/ganesh/gl/GrGLDirectContext.h"
 # include "gpu/ganesh/gl/GrGLInterface.h"
+/* GL types for fence sync - use epoxy for portable GL loading.  */
+# include <epoxy/gl.h>
 #endif
 
 /* ============================================================
@@ -400,6 +402,91 @@ emacs_skia_gl_context_reset (emacs_skia_gl_context_t *ctx)
   (void) ctx;
 }
 #endif
+
+/* ============================================================
+   GL Fence Sync
+   ============================================================ */
+
+#ifdef SK_GL
+struct emacs_skia_fence
+{
+  GLsync sync;
+};
+
+emacs_skia_fence_t *
+emacs_skia_fence_create (void)
+{
+  auto *fence = new emacs_skia_fence_t;
+  fence->sync = glFenceSync (GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  return fence;
+}
+
+bool
+emacs_skia_fence_wait (emacs_skia_fence_t *fence, uint64_t timeout_ns)
+{
+  if (!fence || !fence->sync)
+    return true;
+
+  GLenum result = glClientWaitSync (fence->sync,
+				    GL_SYNC_FLUSH_COMMANDS_BIT,
+				    timeout_ns);
+  return result != GL_TIMEOUT_EXPIRED;
+}
+
+bool
+emacs_skia_fence_is_signaled (emacs_skia_fence_t *fence)
+{
+  if (!fence || !fence->sync)
+    return true;
+
+  GLint status = GL_UNSIGNALED;
+  GLsizei length;
+  glGetSynciv (fence->sync, GL_SYNC_STATUS, sizeof (status),
+	       &length, &status);
+  return status == GL_SIGNALED;
+}
+
+void
+emacs_skia_fence_destroy (emacs_skia_fence_t *fence)
+{
+  if (fence)
+    {
+      if (fence->sync)
+	glDeleteSync (fence->sync);
+      delete fence;
+    }
+}
+
+#else /* !SK_GL */
+
+emacs_skia_fence_t *
+emacs_skia_fence_create (void)
+{
+  return nullptr;
+}
+
+bool
+emacs_skia_fence_wait (emacs_skia_fence_t *fence, uint64_t timeout_ns)
+{
+  (void) fence;
+  (void) timeout_ns;
+  return true;
+}
+
+bool
+emacs_skia_fence_is_signaled (emacs_skia_fence_t *fence)
+{
+  (void) fence;
+  return true;
+}
+
+void
+emacs_skia_fence_destroy (emacs_skia_fence_t *fence)
+{
+  (void) fence;
+}
+
+#endif /* SK_GL */
 
 /* ============================================================
    Surface
@@ -740,6 +827,9 @@ emacs_skia_canvas_draw_line (emacs_skia_canvas_t *canvas, float x0,
     }
 }
 
+/* Stack buffer size for glyph positions - covers most common cases.  */
+constexpr int GLYPH_STACK_BUFFER_SIZE = 64;
+
 void
 emacs_skia_canvas_draw_glyphs (emacs_skia_canvas_t *canvas, int count,
 			       const emacs_skia_glyph_t *glyphs,
@@ -754,19 +844,37 @@ emacs_skia_canvas_draw_glyphs (emacs_skia_canvas_t *canvas, int count,
       return;
     }
 
-  /* Convert positions to SkPoint array */
-  std::vector<SkPoint> sk_positions (count);
+  /* Use stack buffer for small glyph counts to avoid heap allocation.
+     Most text rendering fits within 64 glyphs per call.  */
+  SkPoint stack_buffer[GLYPH_STACK_BUFFER_SIZE];
+  SkPoint *sk_positions;
+  bool heap_allocated = false;
+
+  if (count <= GLYPH_STACK_BUFFER_SIZE)
+    {
+      sk_positions = stack_buffer;
+    }
+  else
+    {
+      sk_positions = new SkPoint[count];
+      heap_allocated = true;
+    }
+
+  /* Convert positions to SkPoint array.  */
   for (int i = 0; i < count; i++)
     {
       sk_positions[i] = to_sk_point (positions[i]);
     }
 
-  /* New Skia API uses SkSpan instead of raw pointers */
+  /* New Skia API uses SkSpan instead of raw pointers.  */
   SkSpan<const SkGlyphID> glyph_span (glyphs, count);
-  SkSpan<const SkPoint> pos_span (sk_positions.data (), count);
+  SkSpan<const SkPoint> pos_span (sk_positions, count);
   canvas->canvas->drawGlyphs (glyph_span, pos_span,
 			      to_sk_point (origin), font->font,
 			      paint->paint);
+
+  if (heap_allocated)
+    delete[] sk_positions;
 }
 
 void

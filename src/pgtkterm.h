@@ -446,6 +446,8 @@ struct pgtk_output
   unsigned int gl_texture;
   unsigned int gl_stencil;
   gint64 last_render_time;
+  /* Track when GL state needs reset - avoids unnecessary resetContext calls.  */
+  bool skia_gl_state_dirty;
 # endif
 #endif
   struct atimer *atimer_visible_bell;
@@ -578,6 +580,7 @@ enum
 #  define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
 #  define FRAME_GL_STENCIL(f) ((f)->output_data.pgtk->gl_stencil)
 #  define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
+#  define FRAME_SKIA_GL_STATE_DIRTY(f) ((f)->output_data.pgtk->skia_gl_state_dirty)
 # endif
 #endif
 
