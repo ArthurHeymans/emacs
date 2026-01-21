@@ -395,15 +395,26 @@ skiafont_encode_char (struct font *font, int c)
 
   /* Use Skia if available.  */
   if (skiafont_info->skia_font)
-    return emacs_skia_font_char_to_glyph (skiafont_info->skia_font,
-					  c);
+    {
+      unsigned glyph
+	= emacs_skia_font_char_to_glyph (skiafont_info->skia_font, c);
+      /* Glyph index 0 means the character is not in the font.
+	 Return FONT_INVALID_CODE so Emacs will look for a fallback font.  */
+      if (glyph)
+	return glyph;
+      return FONT_INVALID_CODE;
+    }
 
   /* Fall back to FreeType directly.  */
   struct font_info *ftfont_info = &skiafont_info->base;
   if (ftfont_info->ft_face)
-    return FT_Get_Char_Index (ftfont_info->ft_face, c);
+    {
+      unsigned glyph = FT_Get_Char_Index (ftfont_info->ft_face, c);
+      if (glyph)
+	return glyph;
+    }
 
-  return 0;
+  return FONT_INVALID_CODE;
 }
 
 static void
