@@ -4427,7 +4427,8 @@ fi
 
 HAVE_CAIRO=no
 if test "${HAVE_X11}" = "yes"; then
-  if test "${with_cairo}" != "no"; then
+  dnl Skip Cairo check if Skia is explicitly enabled (Skia replaces Cairo)
+  if test "${with_cairo}" != "no" && test "${with_skia}" != "yes"; then
     CAIRO_REQUIRED=1.8.0
     CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
     EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
@@ -4467,7 +4468,8 @@ if test "$with_xwidgets" != "no"; then
     fi
     HAVE_XWIDGETS=$HAVE_WEBKIT
     XWIDGETS_OBJ="xwidget.o"
-    if test "$HAVE_X_WINDOWS" = "yes" && test "${with_cairo}" = "no"; then
+    dnl xwidgets on X11 requires cairo-xlib for compositing, even when using Skia
+    if test "$HAVE_X_WINDOWS" = "yes" && test "$HAVE_CAIRO" != "yes"; then
       CAIRO_XLIB_MODULES="cairo >= 1.8.0 cairo-xlib >= 1.8.0"
       EMACS_CHECK_MODULES([CAIRO_XLIB], [$CAIRO_XLIB_MODULES])
       if test $HAVE_CAIRO_XLIB = "yes"; then
@@ -4628,19 +4630,6 @@ if test "$HAVE_SKIA" = "yes"; then
 fi
 AC_SUBST([SKIA_CXX_OBJ])
 
-dnl Option to build Skia without Cairo dependency (experimental)
-AC_ARG_WITH([skia-no-cairo],
-  [AS_HELP_STRING([--with-skia-no-cairo],
-    [Build Skia backend without Cairo dependency (experimental).
-     Some features like bitmap fonts and font caching may be limited.])],
-  [], [with_skia_no_cairo=no])
-
-if test "$with_skia_no_cairo" = "yes" && test "$HAVE_SKIA" = "yes"; then
-  AC_DEFINE([SKIA_NO_CAIRO], [1],
-    [Define to 1 to build Skia backend without Cairo dependency.])
-  AC_MSG_NOTICE([Building Skia backend without Cairo (experimental)])
-fi
-
 if test "$window_system" = "pgtk"; then
   dnl For PGTK, either Cairo or Skia is required
   if test "$HAVE_SKIA" = "yes"; then
@@ -4688,19 +4677,27 @@ fi
 ### Start of font-backend (under X11) section.
 is_xft_version_outdated=no
 if test "${HAVE_X11}" = "yes"; then
-  if test $HAVE_CAIRO = yes; then
+  if test "$HAVE_SKIA" = "yes" || test "$HAVE_CAIRO" = "yes"; then
+    dnl Skia and Cairo both use ftfont, which requires freetype/fontconfig.
     dnl Strict linkers fail with
     dnl ftfont.o: undefined reference to symbol 'FT_New_Face'
     dnl if -lfreetype is not specified.
     dnl The following is needed to set FREETYPE_LIBS.
     EMACS_CHECK_MODULES([FREETYPE], [freetype2])
 
-    test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([cairo requires libfreetype])
+    if test "$HAVE_SKIA" = "yes"; then
+      test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([skia requires libfreetype])
+    else
+      test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([cairo requires libfreetype])
+    fi
 
     EMACS_CHECK_MODULES([FONTCONFIG], [fontconfig >= 2.2.0])
 
-    test "$HAVE_FONTCONFIG" = "no" &&
-      AC_MSG_ERROR([cairo requires libfontconfig])
+    if test "$HAVE_SKIA" = "yes"; then
+      test "$HAVE_FONTCONFIG" = "no" && AC_MSG_ERROR([skia requires libfontconfig])
+    else
+      test "$HAVE_FONTCONFIG" = "no" && AC_MSG_ERROR([cairo requires libfontconfig])
+    fi
     dnl For the "Does Emacs use" message at the end.
     HAVE_XFT=no
   else
@@ -7812,6 +7809,7 @@ AS_ECHO(["  Does Emacs use -lXaw3d?                                 ${HAVE_XAW3D
   Does Emacs use -lwebp?                                  ${HAVE_WEBP}
   Does Emacs use -lsqlite3?                               ${HAVE_SQLITE3}
   Does Emacs use cairo?                                   ${HAVE_CAIRO}
+  Does Emacs use skia?                                    ${HAVE_SKIA}
   Does Emacs use -llcms2?                                 ${HAVE_LCMS2}
   Does Emacs use imagemagick?                             ${HAVE_IMAGEMAGICK}
   Does Emacs use native APIs for images?                  ${NATIVE_IMAGE_API}
