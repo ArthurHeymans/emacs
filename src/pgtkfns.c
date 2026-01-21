@@ -890,7 +890,9 @@ DEFUN ("x-export-frames", Fx_export_frames, Sx_export_frames, 0, 2, 0,
      (Lisp_Object frames, Lisp_Object type)
 {
   Lisp_Object rest, tmp;
+#ifdef USE_CAIRO
   cairo_surface_type_t surface_type;
+#endif
 
   if (!CONSP (frames))
     frames = list1 (frames);
@@ -908,6 +910,12 @@ DEFUN ("x-export-frames", Fx_export_frames, Sx_export_frames, 0, 2, 0,
     }
   frames = Fnreverse (tmp);
 
+#ifdef USE_SKIA
+  /* Skia export supports pdf, svg, and png.  */
+  if (NILP (type) || EQ (type, Qpdf) || EQ (type, Qsvg) || EQ (type, Qpng))
+    return pgtk_skia_export_frames (frames, type);
+  error ("Skia export supports pdf, svg, and png types");
+#else /* USE_CAIRO */
 #ifdef CAIRO_HAS_PDF_SURFACE
   if (NILP (type) || EQ (type, Qpdf))
     surface_type = CAIRO_SURFACE_TYPE_PDF;
@@ -940,6 +948,7 @@ DEFUN ("x-export-frames", Fx_export_frames, Sx_export_frames, 0, 2, 0,
     error ("Unsupported export type");
 
   return pgtk_cr_export_frames (frames, surface_type);
+#endif /* USE_CAIRO */
 }
 
 extern frame_parm_handler pgtk_frame_parm_handlers[];
@@ -1122,10 +1131,17 @@ update_watched_scale_factor (struct atimer *timer)
   if (scale_factor != FRAME_X_OUTPUT (f)->watched_scale_factor)
     {
       FRAME_X_OUTPUT (f)->watched_scale_factor = scale_factor;
+#ifdef USE_SKIA
+      pgtk_skia_update_surface_desired_size (f,
+					     FRAME_SKIA_SURFACE_DESIRED_WIDTH (f),
+					     FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f),
+					     true);
+#else
       pgtk_cr_update_surface_desired_size (f,
 					   FRAME_CR_SURFACE_DESIRED_WIDTH (f),
 					   FRAME_CR_SURFACE_DESIRED_HEIGHT (f),
 					   true);
+#endif
     }
 }
 
@@ -1725,7 +1741,12 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 
   FRAME_X_OUTPUT (f)->border_color_css_provider = NULL;
 
+#ifdef USE_CAIRO
   FRAME_X_OUTPUT (f)->cr_surface_visible_bell = NULL;
+#endif
+#ifdef USE_SKIA
+  FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
+#endif
   FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
   FRAME_X_OUTPUT (f)->watched_scale_factor = 1.0;
   struct timespec ts = make_timespec (1, 0);
@@ -3287,7 +3308,11 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
 
   unblock_input ();
 
+#ifdef USE_SKIA
+  pgtk_skia_update_surface_desired_size (tip_f, width, height, false);
+#else
   pgtk_cr_update_surface_desired_size (tip_f, width, height, false);
+#endif
 
   w->must_be_updated_p = true;
   update_single_window (w);
@@ -3520,6 +3545,7 @@ position (0, 0) of the selected frame's terminal. */)
 }
 
 
+#ifdef USE_CAIRO
 DEFUN ("pgtk-page-setup-dialog", Fpgtk_page_setup_dialog,
        Spgtk_page_setup_dialog, 0, 0, 0,
        doc: /* Pop up a page setup dialog.
@@ -3532,7 +3558,9 @@ The current page setup can be obtained using `x-get-page-setup'.  */)
 
   return Qnil;
 }
+#endif
 
+#ifdef USE_CAIRO
 DEFUN ("pgtk-get-page-setup", Fpgtk_get_page_setup,
        Spgtk_get_page_setup, 0, 0, 0,
        doc: /* Return the value of the current page setup.
@@ -3562,7 +3590,9 @@ height, left-margin, and right-margin values.  */)
 
   return result;
 }
+#endif
 
+#ifdef USE_CAIRO
 DEFUN ("pgtk-print-frames-dialog", Fpgtk_print_frames_dialog, Spgtk_print_frames_dialog, 0, 1, "",
        doc: /* Pop up a print dialog to print the current contents of FRAMES.
 FRAMES should be nil (the selected frame), a frame, or a list of
@@ -3597,6 +3627,7 @@ visible.  */)
 
   return Qnil;
 }
+#endif
 
 static void
 clean_up_dialog (void)
@@ -3843,9 +3874,11 @@ syms_of_pgtkfns (void)
   defsubr (&Sx_hide_tip);
 
   defsubr (&Sx_export_frames);
+#ifdef USE_CAIRO
   defsubr (&Spgtk_page_setup_dialog);
   defsubr (&Spgtk_get_page_setup);
   defsubr (&Spgtk_print_frames_dialog);
+#endif
   defsubr (&Spgtk_backend_display_class);
 
   defsubr (&Spgtk_set_monitor_scale_factor);

@@ -438,6 +438,15 @@ struct pgtk_output
   emacs_skia_paint_t *skia_paint; /* Reusable paint object */
   emacs_skia_surface_t *skia_surface_visible_bell;
   bool skia_gl_initialized;
+# ifdef SK_GL
+  /* Skia GL rendering support.  */
+  GtkWidget *gl_area;
+  GdkGLContext *gdk_gl_context;
+  unsigned int gl_framebuffer;
+  unsigned int gl_texture;
+  unsigned int gl_stencil;
+  gint64 last_render_time;
+# endif
 #endif
   struct atimer *atimer_visible_bell;
 
@@ -562,6 +571,14 @@ enum
     ((f)->output_data.pgtk->skia_surface_desired_height)
 # define FRAME_SKIA_GL_INITIALIZED(f) \
      ((f)->output_data.pgtk->skia_gl_initialized)
+# ifdef SK_GL
+#  define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
+#  define FRAME_GDK_GL_CONTEXT(f) ((f)->output_data.pgtk->gdk_gl_context)
+#  define FRAME_GL_FRAMEBUFFER(f) ((f)->output_data.pgtk->gl_framebuffer)
+#  define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
+#  define FRAME_GL_STENCIL(f) ((f)->output_data.pgtk->gl_stencil)
+#  define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
+# endif
 #endif
 
 

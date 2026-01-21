@@ -5505,8 +5505,9 @@ static bool xpm_load (struct frame *f, struct image *img);
 #endif /* not HAVE_NTGUI */
 #endif /* HAVE_XPM */
 
-#if defined HAVE_XPM || defined USE_CAIRO || defined HAVE_NS	\
-  || defined HAVE_HAIKU || defined HAVE_ANDROID
+#if defined HAVE_XPM || defined USE_CAIRO || defined USE_SKIA	\
+  || defined HAVE_NS || defined HAVE_HAIKU || defined HAVE_PGTK	\
+  || defined HAVE_ANDROID
 
 /* Indices of image specification fields in xpm_format, below.  */
 
@@ -5806,7 +5807,7 @@ xpm_image_p (Lisp_Object object)
 }
 #endif	/* HAVE_XPM || HAVE_NS || HAVE_HAIKU || HAVE_PGTK || HAVE_ANDROID */
 
-#endif /* HAVE_XPM || USE_CAIRO || HAVE_NS || HAVE_HAIKU || HAVE_ANDROID */
+#endif /* HAVE_XPM || USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_HAIKU || HAVE_PGTK || HAVE_ANDROID */
 
 #if defined HAVE_XPM && defined HAVE_X_WINDOWS && !defined USE_GTK
 ptrdiff_t
@@ -7269,15 +7270,52 @@ image_edge_detection (struct frame *f, struct image *img,
 }
 
 
-#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID
+#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined USE_SKIA	\
+  || defined HAVE_HAIKU || defined HAVE_ANDROID
 
 static void
 image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
 			 int x, int y, unsigned int width, unsigned int height,
 			 unsigned long color)
 {
-#ifdef USE_CAIRO
+#ifdef USE_SKIA
+  /* For Skia, we operate directly on the pixmap data.  */
+  if (!pixmap || !pixmap->data)
+    return;
+  /* Draw a simple X cross by setting pixels.  */
+  unsigned char *data = (unsigned char *) pixmap->data;
+  int bpp = pixmap->bits_per_pixel / 8;
+  int bpl = pixmap->bytes_per_line;
+  for (unsigned int i = 0; i < width && i < height; i++)
+    {
+      /* Top-left to bottom-right diagonal */
+      int row1 = y + i;
+      int col1 = x + i;
+      if (row1 < (int) pixmap->height && col1 < (int) pixmap->width)
+	{
+	  unsigned char *p = data + row1 * bpl + col1 * bpp;
+	  if (bpp >= 3)
+	    {
+	      p[0] = (color >> 16) & 0xff;
+	      p[1] = (color >> 8) & 0xff;
+	      p[2] = color & 0xff;
+	    }
+	}
+      /* Top-right to bottom-left diagonal */
+      int row2 = y + i;
+      int col2 = x + width - 1 - i;
+      if (row2 < (int) pixmap->height && col2 >= 0 && col2 < (int) pixmap->width)
+	{
+	  unsigned char *p = data + row2 * bpl + col2 * bpp;
+	  if (bpp >= 3)
+	    {
+	      p[0] = (color >> 16) & 0xff;
+	      p[1] = (color >> 8) & 0xff;
+	      p[2] = color & 0xff;
+	    }
+	}
+    }
+#elif defined USE_CAIRO
   cairo_surface_t *surface
     = cairo_image_surface_create_for_data ((unsigned char *) pixmap->data,
 					   (pixmap->bits_per_pixel == 32
@@ -7365,17 +7403,17 @@ image_disable_image (struct frame *f, struct image *img)
 #ifndef HAVE_NTGUI
 #ifndef HAVE_NS  /* TODO: NS support, however this not needed for toolbars */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU && !defined HAVE_ANDROID
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU && !defined HAVE_ANDROID
 #define CrossForeground(f) BLACK_PIX_DEFAULT (f)
 #define MaskForeground(f)  WHITE_PIX_DEFAULT (f)
-#else  /* USE_CAIRO || HAVE_HAIKU */
+#else  /* USE_CAIRO || USE_SKIA || HAVE_HAIKU || HAVE_ANDROID */
 #define CrossForeground(f) 0
 #define MaskForeground(f)  PIX_MASK_DRAW
-#endif	/* USE_CAIRO || HAVE_HAIKU */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_HAIKU || HAVE_ANDROID */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU
       image_sync_to_pixmaps (f, img);
-#endif	/* !USE_CAIRO && !HAVE_HAIKU */
+#endif	/* !USE_CAIRO && !USE_SKIA && !HAVE_HAIKU */
       image_pixmap_draw_cross (f, img->pixmap, 0, 0, img->width, img->height,
 			       CrossForeground (f));
       if (img->mask)
