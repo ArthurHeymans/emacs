@@ -210,6 +210,56 @@ extern "C"
   emacs_skia_image_t *emacs_skia_surface_make_image_snapshot_rect (
     emacs_skia_surface_t *surface, const emacs_skia_irect_t *rect);
 
+  /* Write callback for PNG/document output.
+     Returns number of bytes written, or 0 on error.  */
+  typedef size_t (*emacs_skia_write_fn) (void *ctx, const void *data,
+					 size_t size);
+
+  /* Write surface to PNG using a callback function.
+     Returns true on success, false on failure.  */
+  bool emacs_skia_surface_write_to_png (emacs_skia_surface_t *surface,
+					emacs_skia_write_fn write_fn,
+					void *write_ctx);
+
+  /* Write image to PNG using a callback function.
+     Returns true on success, false on failure.  */
+  bool emacs_skia_image_write_to_png (emacs_skia_image_t *image,
+				      emacs_skia_write_fn write_fn,
+				      void *write_ctx);
+
+  /* Calculate stride for pixel buffers.
+     format: 0 = A8 (1 byte/pixel), 1 = RGB24/ARGB32 (4 bytes/pixel).
+     Returns stride in bytes (4-byte aligned).  */
+  int emacs_skia_format_stride_for_width (int format, int width);
+
+  /* ============================================================
+     Image Transformation
+     ============================================================ */
+
+  /* Opaque image transformation type.  */
+  typedef struct emacs_skia_image_transform emacs_skia_image_transform_t;
+
+  /* Create/destroy image transformation.  */
+  emacs_skia_image_transform_t *emacs_skia_image_transform_create (void);
+  void emacs_skia_image_transform_destroy (
+    emacs_skia_image_transform_t *transform);
+
+  /* Set transformation matrix.
+     matrix is [a, b, c, d, e, f] representing:
+     [a c e]
+     [b d f]
+     [0 0 1]  */
+  void emacs_skia_image_transform_set_matrix (
+    emacs_skia_image_transform_t *transform, const float matrix[6]);
+  void emacs_skia_image_transform_get_matrix (
+    emacs_skia_image_transform_t *transform, float matrix[6]);
+
+  /* Set/get smoothing (filter mode).  */
+  void emacs_skia_image_transform_set_smoothing (
+    emacs_skia_image_transform_t *transform, bool smoothing);
+  bool emacs_skia_image_transform_get_smoothing (
+    emacs_skia_image_transform_t *transform);
+
   /* ============================================================
      Canvas (drawing context)
      ============================================================ */
@@ -274,6 +324,12 @@ extern "C"
   void emacs_skia_canvas_draw_image_rect (
     emacs_skia_canvas_t *canvas, emacs_skia_image_t *image,
     const emacs_skia_rect_t *src, const emacs_skia_rect_t *dst,
+    emacs_skia_paint_t *paint);
+
+  /* Draw image with transformation applied.  */
+  void emacs_skia_canvas_draw_image_transformed (
+    emacs_skia_canvas_t *canvas, emacs_skia_image_t *image,
+    emacs_skia_image_transform_t *transform, float x, float y,
     emacs_skia_paint_t *paint);
 
   /* Draw a path */
@@ -521,11 +577,6 @@ extern "C"
 
   /* Opaque document type for multi-page PDF output */
   typedef struct emacs_skia_document emacs_skia_document_t;
-
-  /* Write callback for document output.
-     Returns number of bytes written, or 0 on error.  */
-  typedef size_t (*emacs_skia_write_fn) (void *ctx, const void *data,
-					 size_t size);
 
   /* Create a PDF document that writes to a callback.
      width/height are the initial page dimensions in points.  */

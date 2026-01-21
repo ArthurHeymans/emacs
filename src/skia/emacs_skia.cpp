@@ -40,6 +40,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 #include "core/SkTileMode.h"
 #include "core/SkTypeface.h"
 #include "effects/SkDashPathEffect.h"
+#include "encode/SkPngEncoder.h"
 
 /* Platform-specific font manager for Linux (fontconfig) */
 #ifdef HAVE_FONTCONFIG
@@ -1813,3 +1814,225 @@ emacs_skia_svg_canvas_finish (emacs_skia_canvas_t *canvas)
   (void) canvas;
 }
 #endif
+
+/* ============================================================
+   PNG Export
+   ============================================================ */
+
+/* Helper to encode pixmap to PNG and write via callback.
+   Uses SkDynamicMemoryWStream to avoid RTTI issues with custom streams.  */
+static bool
+encode_png_to_callback (const SkPixmap &pixmap,
+			emacs_skia_write_fn write_fn, void *write_ctx)
+{
+  SkDynamicMemoryWStream stream;
+  SkPngEncoder::Options options;
+
+  if (!SkPngEncoder::Encode (&stream, pixmap, options))
+    return false;
+
+  /* Write the encoded data to the callback.  */
+  sk_sp<SkData> data = stream.detachAsData ();
+  if (!data)
+    return false;
+
+  size_t written = write_fn (write_ctx, data->data (), data->size ());
+  return written == data->size ();
+}
+
+/* Write surface to PNG using a callback function.
+   Returns true on success, false on failure.  */
+bool
+emacs_skia_surface_write_to_png (emacs_skia_surface_t *surface,
+				 emacs_skia_write_fn write_fn,
+				 void *write_ctx)
+{
+  if (!surface || !surface->surface || !write_fn)
+    return false;
+
+  /* Create an image snapshot of the surface.  */
+  sk_sp<SkImage> image = surface->surface->makeImageSnapshot ();
+  if (!image)
+    return false;
+
+  /* Read pixels into a raster format suitable for encoding.  */
+  SkPixmap pixmap;
+  if (!image->peekPixels (&pixmap))
+    {
+      /* For GPU surfaces, we need to read back the pixels.  */
+      SkImageInfo info
+	= SkImageInfo::Make (image->width (), image->height (),
+			     kRGBA_8888_SkColorType,
+			     kUnpremul_SkAlphaType);
+      std::vector<uint8_t> pixels (info.computeMinByteSize ());
+      if (!image->readPixels (info, pixels.data (), info.minRowBytes (),
+			      0, 0))
+	return false;
+
+      SkPixmap temp_pixmap (info, pixels.data (), info.minRowBytes ());
+      return encode_png_to_callback (temp_pixmap, write_fn, write_ctx);
+    }
+
+  return encode_png_to_callback (pixmap, write_fn, write_ctx);
+}
+
+/* Write image to PNG using a callback function.
+   Returns true on success, false on failure.  */
+bool
+emacs_skia_image_write_to_png (emacs_skia_image_t *image,
+			       emacs_skia_write_fn write_fn,
+			       void *write_ctx)
+{
+  if (!image || !image->image || !write_fn)
+    return false;
+
+  SkPixmap pixmap;
+  if (!image->image->peekPixels (&pixmap))
+    {
+      /* Need to read pixels back.  */
+      SkImageInfo info
+	= SkImageInfo::Make (image->image->width (),
+			     image->image->height (),
+			     kRGBA_8888_SkColorType,
+			     kUnpremul_SkAlphaType);
+      std::vector<uint8_t> pixels (info.computeMinByteSize ());
+      if (!image->image->readPixels (info, pixels.data (),
+				     info.minRowBytes (), 0, 0))
+	return false;
+
+      SkPixmap temp_pixmap (info, pixels.data (), info.minRowBytes ());
+      return encode_png_to_callback (temp_pixmap, write_fn, write_ctx);
+    }
+
+  return encode_png_to_callback (pixmap, write_fn, write_ctx);
+}
+
+/* ============================================================
+   Image Transformation
+   ============================================================ */
+
+/* Image transformation data for Skia.
+   This is used to store transformation matrices for images,
+   replacing the use of cairo_pattern_t for this purpose.  */
+struct emacs_skia_image_transform
+{
+  /* 3x3 transformation matrix in row-major order.
+     [a c e]   [0 2 4]
+     [b d f] = [1 3 5]
+     [0 0 1]   (implicit) */
+  float matrix[6];
+  /* Filter mode: true = bilinear, false = nearest neighbor.  */
+  bool smoothing;
+};
+
+emacs_skia_image_transform_t *
+emacs_skia_image_transform_create (void)
+{
+  auto result = new emacs_skia_image_transform_t;
+  /* Initialize to identity matrix.  */
+  result->matrix[0] = 1.0f; /* a = scale x */
+  result->matrix[1] = 0.0f; /* b = skew y */
+  result->matrix[2] = 0.0f; /* c = skew x */
+  result->matrix[3] = 1.0f; /* d = scale y */
+  result->matrix[4] = 0.0f; /* e = translate x */
+  result->matrix[5] = 0.0f; /* f = translate y */
+  result->smoothing = true;
+  return result;
+}
+
+void
+emacs_skia_image_transform_destroy (emacs_skia_image_transform_t *transform)
+{
+  delete transform;
+}
+
+void
+emacs_skia_image_transform_set_matrix (emacs_skia_image_transform_t *transform,
+				       const float matrix[6])
+{
+  if (transform && matrix)
+    {
+      for (int i = 0; i < 6; i++)
+	transform->matrix[i] = matrix[i];
+    }
+}
+
+void
+emacs_skia_image_transform_get_matrix (emacs_skia_image_transform_t *transform,
+				       float matrix[6])
+{
+  if (transform && matrix)
+    {
+      for (int i = 0; i < 6; i++)
+	matrix[i] = transform->matrix[i];
+    }
+}
+
+void
+emacs_skia_image_transform_set_smoothing (emacs_skia_image_transform_t *transform,
+					  bool smoothing)
+{
+  if (transform)
+    transform->smoothing = smoothing;
+}
+
+bool
+emacs_skia_image_transform_get_smoothing (emacs_skia_image_transform_t *transform)
+{
+  return transform ? transform->smoothing : true;
+}
+
+/* Draw an image with transformation applied.  */
+void
+emacs_skia_canvas_draw_image_transformed (emacs_skia_canvas_t *canvas,
+					  emacs_skia_image_t *image,
+					  emacs_skia_image_transform_t *transform,
+					  float x, float y,
+					  emacs_skia_paint_t *paint)
+{
+  if (!canvas || !canvas->canvas || !image || !image->image)
+    return;
+
+  canvas->canvas->save ();
+
+  if (transform)
+    {
+      /* Apply the transformation matrix.
+	 Skia uses column-major SkMatrix, but our matrix is in
+	 [a c e; b d f] format which maps to:
+	 SkMatrix: [scaleX, skewX, transX, skewY, scaleY, transY, ...] */
+      SkMatrix sk_matrix;
+      sk_matrix.setAll (transform->matrix[0], /* scaleX = a */
+			transform->matrix[2], /* skewX = c */
+			transform->matrix[4], /* transX = e */
+			transform->matrix[1], /* skewY = b */
+			transform->matrix[3], /* scaleY = d */
+			transform->matrix[5], /* transY = f */
+			0, 0, 1);
+      canvas->canvas->concat (sk_matrix);
+    }
+
+  SkSamplingOptions sampling (
+    transform && transform->smoothing ? SkFilterMode::kLinear
+				      : SkFilterMode::kNearest);
+
+  if (paint)
+    canvas->canvas->drawImage (image->image.get (), x, y, sampling,
+			       &paint->paint);
+  else
+    canvas->canvas->drawImage (image->image.get (), x, y, sampling);
+
+  canvas->canvas->restore ();
+}
+
+/* Calculate stride for pixel buffers (replacement for
+   cairo_format_stride_for_width). Skia uses 4-byte aligned rows for RGBA.  */
+int
+emacs_skia_format_stride_for_width (int format, int width)
+{
+  /* format: 0 = A8 (1 byte per pixel), 1 = RGB24/ARGB32 (4 bytes per pixel) */
+  int bytes_per_pixel = (format == 0) ? 1 : 4;
+  int stride = width * bytes_per_pixel;
+  /* Align to 4 bytes (Skia's default alignment).  */
+  return (stride + 3) & ~3;
+}

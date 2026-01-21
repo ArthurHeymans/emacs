@@ -8846,7 +8846,22 @@ pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
 
       /* Resize the FBO texture.  */
       if (FRAME_GL_FRAMEBUFFER (f))
-	pgtk_setup_gl_framebuffer (f, width, height);
+	{
+	  pgtk_setup_gl_framebuffer (f, width, height);
+
+	  /* Clear FBO to background color (not black) so that if GTK
+	     calls render before Emacs redraws, the enlarged area shows
+	     the proper background instead of black.  */
+	  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+	  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+	  float r = RED_FROM_ULONG (bg) / 255.0f;
+	  float g = GREEN_FROM_ULONG (bg) / 255.0f;
+	  float b = BLUE_FROM_ULONG (bg) / 255.0f;
+	  glClearColor (r, g, b, 1.0f);
+	  glClear (GL_COLOR_BUFFER_BIT);
+	  glFinish ();
+	  glBindFramebuffer (GL_FRAMEBUFFER, 0);
+	}
 
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
@@ -9050,9 +9065,37 @@ pgtk_begin_skia_clip (struct frame *f)
 	  /* Make the GtkGLArea's context current.  */
 	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
 
-	  /* Set up FBO if not already done.  */
+	  /* Set up FBO if not already done, or resize if size changed.
+	     This handles cases where size_allocate fires before the
+	     GtkGLArea resize signal (e.g., tiling WM fullscreen).  */
 	  if (!FRAME_GL_FRAMEBUFFER (f))
 	    pgtk_setup_gl_framebuffer (f, width, height);
+	  else
+	    {
+	      /* Check if FBO needs resizing by querying the texture size.  */
+	      GLint tex_width = 0, tex_height = 0;
+	      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
+	      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+					&tex_width);
+	      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+					&tex_height);
+	      glBindTexture (GL_TEXTURE_2D, 0);
+
+	      if (tex_width != width || tex_height != height)
+		{
+		  pgtk_setup_gl_framebuffer (f, width, height);
+		  /* Clear FBO to background color after resize.  */
+		  glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
+		  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+		  float r = RED_FROM_ULONG (bg) / 255.0f;
+		  float g = GREEN_FROM_ULONG (bg) / 255.0f;
+		  float b = BLUE_FROM_ULONG (bg) / 255.0f;
+		  glClearColor (r, g, b, 1.0f);
+		  glClear (GL_COLOR_BUFFER_BIT);
+		  glFinish ();
+		  glBindFramebuffer (GL_FRAMEBUFFER, 0);
+		}
+	    }
 
 	  /* Create Skia surface if needed.  */
 	  if (!FRAME_SKIA_SURFACE (f) && FRAME_GL_FRAMEBUFFER (f))
@@ -9653,7 +9696,7 @@ pgtk_skia_accumulate_data (void *ctx, const void *data, size_t size)
   return size;
 }
 
-/* Export frames to PDF or SVG using Skia.
+/* Export frames to PDF, SVG, or PNG using Skia.
    Returns the exported data as a unibyte string.  */
 Lisp_Object
 pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type)
@@ -9664,12 +9707,13 @@ pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type)
   specpdl_ref count = SPECPDL_INDEX ();
   bool is_pdf = NILP (type) || EQ (type, Qpdf);
   bool is_svg = EQ (type, Qsvg);
+  bool is_png = EQ (type, Qpng);
 
-  if (!is_pdf && !is_svg)
-    error ("Skia export only supports pdf and svg types");
+  if (!is_pdf && !is_svg && !is_png)
+    error ("Skia export supports pdf, svg, and png types");
 
-  if (is_svg && !NILP (XCDR (frames)))
-    error ("SVG export cannot handle multiple frames");
+  if ((is_svg || is_png) && !NILP (XCDR (frames)))
+    error ("SVG and PNG export cannot handle multiple frames");
 
   redisplay_preserve_echo_area (31);
 
@@ -9754,6 +9798,50 @@ pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type)
 
       FRAME_SKIA_CANVAS (f) = saved_canvas;
       emacs_skia_svg_canvas_finish (canvas);
+    }
+  else if (is_png)
+    {
+      /* Create a temporary raster surface for PNG export.  */
+      emacs_skia_surface_t *png_surface
+	= emacs_skia_surface_create_raster (width, height);
+      if (!png_surface)
+	{
+	  unblock_input ();
+	  error ("Failed to create PNG surface");
+	}
+
+      emacs_skia_canvas_t *canvas
+	= emacs_skia_surface_get_canvas (png_surface);
+      if (!canvas)
+	{
+	  emacs_skia_surface_destroy (png_surface);
+	  unblock_input ();
+	  error ("Failed to get PNG canvas");
+	}
+
+      /* Save current Skia canvas and use PNG canvas.  */
+      emacs_skia_canvas_t *saved_canvas = FRAME_SKIA_CANVAS (f);
+      FRAME_SKIA_CANVAS (f) = canvas;
+
+      /* Clear and redraw the frame.  */
+      emacs_skia_canvas_clear (canvas,
+			       EMACS_SKIA_COLOR_RGB (255, 255, 255));
+      expose_frame (f, 0, 0, width, height);
+
+      FRAME_SKIA_CANVAS (f) = saved_canvas;
+
+      /* Flush the surface and encode to PNG.  */
+      emacs_skia_surface_flush (png_surface);
+      if (!emacs_skia_surface_write_to_png (png_surface,
+					    pgtk_skia_accumulate_data,
+					    &acc))
+	{
+	  emacs_skia_surface_destroy (png_surface);
+	  unblock_input ();
+	  error ("Failed to encode PNG");
+	}
+
+      emacs_skia_surface_destroy (png_surface);
     }
 
   unblock_input ();

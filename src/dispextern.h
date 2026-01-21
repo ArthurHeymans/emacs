@@ -3234,6 +3234,8 @@ struct image
   /* Skia image for this image (separate from cr_data for hybrid
    * builds) */
   void *skia_data;
+  /* Skia image transformation (for rotation/scaling).  */
+  void *skia_transform;
 # endif
 # ifdef HAVE_X_WINDOWS
   /* X images of the image, corresponding to the above Pixmaps.

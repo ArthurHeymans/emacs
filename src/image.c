@@ -64,6 +64,10 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # include TERM_HEADER
 #endif /* HAVE_WINDOW_SYSTEM */
 
+#ifdef USE_SKIA
+# include "skia/emacs_skia.h"
+#endif
+
 #ifdef HAVE_X_WINDOWS
 typedef struct x_bitmap_record Bitmap_Record;
 # ifndef USE_CAIRO
@@ -249,11 +253,18 @@ image_create_pix_container (unsigned int width, unsigned int height,
   pimg->width = width;
   pimg->height = height;
   pimg->bits_per_pixel = depth == 1 ? 8 : 32;
+#if defined(USE_CAIRO)
   pimg->bytes_per_line
     = cairo_format_stride_for_width ((depth == 1
 					? CAIRO_FORMAT_A8
 					: CAIRO_FORMAT_RGB24),
 				     width);
+#elif defined(USE_SKIA)
+  /* Use Skia's stride calculation when Cairo is not available.
+     Format 0 = A8 (1 byte/pixel), 1 = RGB24/ARGB32 (4 bytes/pixel).  */
+  pimg->bytes_per_line
+    = emacs_skia_format_stride_for_width (depth == 1 ? 0 : 1, width);
+#endif
   pimg->data = xmalloc (pimg->bytes_per_line * height);
 
   return pimg;
@@ -2273,6 +2284,11 @@ image_clear_image_1 (struct frame *f, struct image *img, int flags)
       emacs_skia_image_destroy (img->skia_data);
       img->skia_data = NULL;
     }
+  if (img->skia_transform)
+    {
+      emacs_skia_image_transform_destroy (img->skia_transform);
+      img->skia_transform = NULL;
+    }
 #endif /* USE_SKIA */
 }
 
@@ -3518,6 +3534,45 @@ image_set_transform (struct frame *f, struct image *img)
      drawing time, so store it for later.  */
   ns_image_set_transform (img->pixmap, matrix);
   ns_image_set_smoothing (img->pixmap, smoothing);
+# elif defined USE_SKIA
+  /* Store transformation in Skia-native format.  */
+  {
+    emacs_skia_image_transform_t *transform
+      = emacs_skia_image_transform_create ();
+    if (transform)
+      {
+	/* Convert 3x3 matrix to Skia's 6-element format [a,b,c,d,e,f].  */
+	float skia_matrix[6] = {
+	  (float) matrix[0][0], /* a = scale x */
+	  (float) matrix[0][1], /* b = skew y */
+	  (float) matrix[1][0], /* c = skew x */
+	  (float) matrix[1][1], /* d = scale y */
+	  (float) matrix[2][0], /* e = translate x */
+	  (float) matrix[2][1]  /* f = translate y */
+	};
+	emacs_skia_image_transform_set_matrix (transform, skia_matrix);
+	emacs_skia_image_transform_set_smoothing (transform, smoothing);
+
+	/* Free any existing transform.  */
+	if (img->skia_transform)
+	  emacs_skia_image_transform_destroy (img->skia_transform);
+	img->skia_transform = transform;
+      }
+  }
+#  ifdef USE_CAIRO
+  /* For hybrid builds, also store in Cairo format for compatibility.  */
+  {
+    cairo_matrix_t cr_matrix
+      = { matrix[0][0], matrix[0][1], matrix[1][0],
+	  matrix[1][1], matrix[2][0], matrix[2][1] };
+    cairo_pattern_t *pattern = cairo_pattern_create_rgb (0, 0, 0);
+    cairo_pattern_set_matrix (pattern, &cr_matrix);
+    cairo_pattern_set_filter (pattern, smoothing
+				       ? CAIRO_FILTER_BEST
+				       : CAIRO_FILTER_NEAREST);
+    img->cr_data = pattern;
+  }
+#  endif /* USE_CAIRO */
 # elif defined USE_CAIRO
   cairo_matrix_t cr_matrix
     = { matrix[0][0], matrix[0][1], matrix[1][0],
