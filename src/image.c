@@ -64,6 +64,10 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include TERM_HEADER
 #endif /* HAVE_WINDOW_SYSTEM */
 
+#ifdef USE_SKIA
+# include "skia/emacs_skia.h"
+#endif
+
 #ifdef HAVE_X_WINDOWS
 typedef struct x_bitmap_record Bitmap_Record;
 #ifndef USE_CAIRO
@@ -76,7 +80,7 @@ typedef struct x_bitmap_record Bitmap_Record;
 #endif	/* !USE_CAIRO */
 #endif /* HAVE_X_WINDOWS */
 
-#if defined(USE_CAIRO) || defined(HAVE_NS)
+#if defined (USE_CAIRO) || defined (USE_SKIA) || defined (HAVE_NS)
 #define RGB_TO_ULONG(r, g, b) (((r) << 16) | ((g) << 8) | (b))
 #ifndef HAVE_NS
 #define ARGB_TO_ULONG(a, r, g, b) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
@@ -89,7 +93,7 @@ typedef struct x_bitmap_record Bitmap_Record;
 #define BLUE16_FROM_ULONG(color)	(BLUE_FROM_ULONG (color) * 0x101)
 #endif
 
-#ifdef USE_CAIRO
+#if defined (USE_CAIRO) || defined (USE_SKIA)
 #define GET_PIXEL image_pix_context_get_pixel
 #define PUT_PIXEL image_pix_container_put_pixel
 #define NO_PIXMAP 0
@@ -99,7 +103,7 @@ typedef struct x_bitmap_record Bitmap_Record;
 
 static unsigned long image_alloc_image_color (struct frame *, struct image *,
 					      Lisp_Object, unsigned long);
-#endif	/* USE_CAIRO */
+#endif	/* USE_CAIRO || USE_SKIA */
 
 #if defined HAVE_PGTK && defined HAVE_IMAGEMAGICK
 /* In pgtk, we don't want to create scaled image.  If we create scaled
@@ -228,7 +232,7 @@ static HBITMAP w32_create_pixmap_from_bitmap_data (int, int, char *);
 static void anim_prune_animation_cache (Lisp_Object);
 #endif
 
-#ifdef USE_CAIRO
+#if defined (USE_CAIRO) || defined (USE_SKIA)
 
 static Emacs_Pix_Container
 image_create_pix_container (unsigned int width, unsigned int height,
@@ -240,10 +244,17 @@ image_create_pix_container (unsigned int width, unsigned int height,
   pimg->width = width;
   pimg->height = height;
   pimg->bits_per_pixel = depth == 1 ? 8 : 32;
+#ifdef USE_CAIRO
   pimg->bytes_per_line = cairo_format_stride_for_width ((depth == 1
 							 ? CAIRO_FORMAT_A8
 							 : CAIRO_FORMAT_RGB24),
 							width);
+#elif defined (USE_SKIA)
+  /* Use Skia's stride calculation when Cairo is not available.
+     Format 0 = A8 (1 byte/pixel), 1 = RGB24/ARGB32 (4 bytes/pixel).  */
+  pimg->bytes_per_line
+    = emacs_skia_format_stride_for_width (depth == 1 ? 0 : 1, width);
+#endif
   pimg->data = xmalloc (pimg->bytes_per_line * height);
 
   return pimg;
@@ -288,6 +299,7 @@ image_pix_container_create_from_bitmap_data (char *data, unsigned int width,
   return pimg;
 }
 
+#ifdef USE_CAIRO
 static cairo_surface_t *
 cr_create_surface_from_pix_containers (Emacs_Pix_Container pimg,
 				       Emacs_Pix_Container mask)
@@ -349,8 +361,68 @@ cr_put_image_to_cr_data (struct image *img)
 
   img->cr_data = pattern;
 }
-
 #endif	/* USE_CAIRO */
+
+#endif	/* USE_CAIRO || USE_SKIA */
+
+#ifdef USE_SKIA
+/* Create a Skia image from pixel containers.
+   This converts the pixel data into a Skia image for rendering.  */
+static void
+skia_put_image_to_skia_data (struct image *img)
+{
+  if (img->pixmap && img->pixmap->data)
+    {
+      int width = img->pixmap->width;
+      int height = img->pixmap->height;
+      int stride = img->pixmap->bytes_per_line;
+      unsigned char *data = (unsigned char *) img->pixmap->data;
+
+      /* Create a copy of the data since Skia needs to own it.
+	 For Skia, we create a copy with premultiplied alpha.  */
+      size_t data_size = stride * height;
+      unsigned char *data_copy = xmalloc (data_size);
+      memcpy (data_copy, data, data_size);
+
+      /* If we have a mask, apply it to create premultiplied alpha.
+	 Otherwise, set alpha to 0xFF for Skia to render correctly.  */
+      if (img->mask && img->mask->data)
+	{
+	  unsigned char *mask_data = (unsigned char *) img->mask->data;
+	  int mask_stride = img->mask->bytes_per_line;
+	  for (int y = 0; y < height; y++)
+	    {
+	      uint32_t *row = (uint32_t *) (data_copy + y * stride);
+	      uint8_t *mask_row = mask_data + y * mask_stride;
+	      for (int x = 0; x < width; x++)
+		{
+		  uint8_t alpha = mask_row[x];
+		  uint32_t pixel = row[x];
+		  int r = ((pixel >> 16) & 0xFF) * alpha / 255;
+		  int g = ((pixel >> 8) & 0xFF) * alpha / 255;
+		  int b = (pixel & 0xFF) * alpha / 255;
+		  row[x] = (alpha << 24) | (r << 16) | (g << 8) | b;
+		}
+	    }
+	}
+      else
+	{
+	  /* No mask - set alpha to fully opaque.  */
+	  for (int y = 0; y < height; y++)
+	    {
+	      uint32_t *row = (uint32_t *) (data_copy + y * stride);
+	      for (int x = 0; x < width; x++)
+		row[x] = row[x] | 0xFF000000;
+	    }
+	}
+
+      bool has_alpha = (img->mask && img->mask->data);
+      img->skia_data = emacs_skia_image_create_from_bgra_pixels (
+	width, height, data_copy, stride, has_alpha);
+      xfree (data_copy);
+    }
+}
+#endif /* USE_SKIA */
 
 #ifdef HAVE_NS
 /* Use with images created by ns_image_for_XPM.  */
@@ -677,7 +749,11 @@ image_create_bitmap_from_data (struct frame *f, char *bits,
 
 #ifdef HAVE_PGTK
   dpyinfo->bitmaps[id - 1].depth = 1;
+# ifdef USE_SKIA
+  dpyinfo->bitmaps[id - 1].skia_image = NULL; /* Created on demand */
+# else
   dpyinfo->bitmaps[id - 1].pattern = pattern;
+# endif
 #endif
 
 #ifdef HAVE_HAIKU
@@ -861,8 +937,15 @@ image_create_bitmap_from_file (struct frame *f, Lisp_Object file)
   dpyinfo->bitmaps[id - 1].file = xlispstrdup (file);
   dpyinfo->bitmaps[id - 1].height = width;
   dpyinfo->bitmaps[id - 1].width = height;
+# ifdef USE_SKIA
+  dpyinfo->bitmaps[id - 1].skia_image
+    = emacs_skia_image_create_from_bitmap ((unsigned char *) data,
+					   width, height,
+					   (width + 7) / 8);
+# else
   dpyinfo->bitmaps[id - 1].pattern
     = image_bitmap_to_cr_pattern (data, width, height);
+# endif
   xfree (contents);
   xfree (data);
   return id;
@@ -1116,8 +1199,13 @@ free_bitmap_record (Display_Info *dpyinfo, Bitmap_Record *bm)
 #endif
 
 #ifdef HAVE_PGTK
+# ifdef USE_SKIA
+  if (bm->skia_image != NULL)
+    emacs_skia_image_destroy (bm->skia_image);
+# else
   if (bm->pattern != NULL)
     cairo_pattern_destroy (bm->pattern);
+# endif
 #endif
 
 #ifdef HAVE_HAIKU
@@ -1860,6 +1948,12 @@ prepare_image_for_display (struct frame *f, struct image *img)
 	     we have img->pixmap->data/img->mask->data.  */
 	  IMAGE_BACKGROUND (img, f, img->pixmap);
 	  IMAGE_BACKGROUND_TRANSPARENT (img, f, img->mask);
+# ifdef USE_SKIA
+	  /* Create Skia image BEFORE cr_put_image_to_cr_data,
+	     which frees the pixel data.  */
+	  if (img->skia_data == NULL)
+	    skia_put_image_to_skia_data (img);
+# endif
 	  cr_put_image_to_cr_data (img);
 	  if (img->cr_data == NULL)
 	    {
@@ -1867,6 +1961,17 @@ prepare_image_for_display (struct frame *f, struct image *img)
 	      img->type->free_img (f, img);
 	    }
 	}
+      unblock_input ();
+    }
+#elif defined (USE_SKIA)
+  /* For Skia without Cairo, create Skia image from pixel containers.  */
+  if (!img->load_failed_p)
+    {
+      block_input ();
+      IMAGE_BACKGROUND (img, f, img->pixmap);
+      IMAGE_BACKGROUND_TRANSPARENT (img, f, img->mask);
+      if (img->skia_data == NULL)
+	skia_put_image_to_skia_data (img);
       unblock_input ();
     }
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
@@ -2124,6 +2229,19 @@ image_clear_image_1 (struct frame *f, struct image *img, int flags)
       img->cr_data = NULL;
     }
 #endif	/* USE_CAIRO */
+
+#ifdef USE_SKIA
+  if (img->skia_data)
+    {
+      emacs_skia_image_destroy (img->skia_data);
+      img->skia_data = NULL;
+    }
+  if (img->skia_transform)
+    {
+      emacs_skia_image_transform_destroy (img->skia_transform);
+      img->skia_transform = NULL;
+    }
+#endif /* USE_SKIA */
 }
 
 /* Free X resources of image IMG which is used on frame F.  */
@@ -3074,8 +3192,8 @@ image_set_transform (struct frame *f, struct image *img)
   /* Determine flipping.  */
   flip = !NILP (image_spec_value (img->spec, QCflip, NULL));
 
-# if defined USE_CAIRO || defined HAVE_XRENDER || defined HAVE_NS || defined HAVE_HAIKU \
-  || defined HAVE_ANDROID || defined HAVE_NTGUI
+# if defined USE_CAIRO || defined USE_SKIA || defined HAVE_XRENDER || defined HAVE_NS \
+  || defined HAVE_HAIKU || defined HAVE_ANDROID || defined HAVE_NTGUI
   /* We want scale up operations to use a nearest neighbor filter to
      show real pixels instead of munging them, but scale down
      operations to use a blended filter, to avoid aliasing and the like.  */
@@ -3347,6 +3465,44 @@ image_set_transform (struct frame *f, struct image *img)
      drawing time, so store it for later.  */
   ns_image_set_transform (img->pixmap, matrix);
   ns_image_set_smoothing (img->pixmap, smoothing);
+# elif defined USE_SKIA
+  /* Store transformation in Skia-native format.  */
+  {
+    emacs_skia_image_transform_t *transform
+      = emacs_skia_image_transform_create ();
+    if (transform)
+      {
+	/* Convert 3x3 matrix to Skia's 6-element format [a,b,c,d,e,f].  */
+	float skia_matrix[6] = {
+	  (float) matrix[0][0], /* a = scale x */
+	  (float) matrix[0][1], /* b = skew y */
+	  (float) matrix[1][0], /* c = skew x */
+	  (float) matrix[1][1], /* d = scale y */
+	  (float) matrix[2][0], /* e = translate x */
+	  (float) matrix[2][1]  /* f = translate y */
+	};
+	emacs_skia_image_transform_set_matrix (transform, skia_matrix);
+	emacs_skia_image_transform_set_smoothing (transform, smoothing);
+
+	/* Free any existing transform.  */
+	if (img->skia_transform)
+	  emacs_skia_image_transform_destroy (img->skia_transform);
+	img->skia_transform = transform;
+      }
+  }
+#  ifdef USE_CAIRO
+  /* For hybrid builds, also store in Cairo format for compatibility.  */
+  {
+    cairo_matrix_t cr_matrix = {matrix[0][0], matrix[0][1], matrix[1][0],
+				matrix[1][1], matrix[2][0], matrix[2][1]};
+    cairo_pattern_t *pattern = cairo_pattern_create_rgb (0, 0, 0);
+    cairo_pattern_set_matrix (pattern, &cr_matrix);
+    cairo_pattern_set_filter (pattern, smoothing
+			      ? CAIRO_FILTER_BEST : CAIRO_FILTER_NEAREST);
+    /* Dummy solid color pattern just to record pattern matrix.  */
+    img->cr_data = pattern;
+  }
+#  endif
 # elif defined USE_CAIRO
   cairo_matrix_t cr_matrix = {matrix[0][0], matrix[0][1], matrix[1][0],
 			      matrix[1][1], matrix[2][0], matrix[2][1]};
@@ -4005,7 +4161,7 @@ image_create_x_image_and_pixmap_1 (struct frame *f, int width, int height, int d
                                    Emacs_Pix_Container *pimg,
                                    Emacs_Pixmap *pixmap, Picture *picture)
 {
-#ifdef USE_CAIRO
+#if defined USE_CAIRO || defined USE_SKIA
   eassert (input_blocked_p ());
 
   /* Allocate a pixmap of the same size.  */
@@ -4169,11 +4325,11 @@ image_destroy_x_image (Emacs_Pix_Container pimg)
   eassert (input_blocked_p ());
   if (pimg)
     {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+#if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU || defined HAVE_NS
       /* On these systems, Emacs_Pix_Containers always point to the same
 	 data as pixmaps in `struct image', and therefore must never be
 	 freed separately.  */
-#endif	/* USE_CAIRO || HAVE_HAIKU || HAVE_NS */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_HAIKU || HAVE_NS */
 #ifdef HAVE_NTGUI
       /* Data will be freed by DestroyObject.  */
       pimg->data = NULL;
@@ -4192,7 +4348,7 @@ static void
 gui_put_x_image (struct frame *f, Emacs_Pix_Container pimg,
                  Emacs_Pixmap pixmap, int width, int height)
 {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS
+#if defined USE_CAIRO || defined USE_SKIA || defined HAVE_HAIKU || defined HAVE_NS
   eassert (pimg == pixmap);
 #elif defined HAVE_X_WINDOWS
   GC gc;
@@ -4308,7 +4464,7 @@ image_unget_x_image_or_dc (struct image *img, bool mask_p,
 static Emacs_Pix_Container
 image_get_x_image (struct frame *f, struct image *img, bool mask_p)
 {
-#if defined USE_CAIRO || defined (HAVE_HAIKU)
+#if defined USE_CAIRO || defined USE_SKIA || defined (HAVE_HAIKU)
   return !mask_p ? img->pixmap : img->mask;
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
   XImage *ximg_in_img = !mask_p ? img->ximg : img->mask_img;
@@ -5404,8 +5560,8 @@ static bool xpm_load (struct frame *f, struct image *img);
 #endif /* not HAVE_NTGUI */
 #endif /* HAVE_XPM */
 
-#if defined HAVE_XPM || defined USE_CAIRO || defined HAVE_NS	\
-  || defined HAVE_HAIKU || defined HAVE_ANDROID
+#if defined HAVE_XPM || defined USE_CAIRO || defined USE_SKIA \
+  || defined HAVE_NS || defined HAVE_HAIKU || defined HAVE_ANDROID
 
 /* Indices of image specification fields in xpm_format, below.  */
 
@@ -5764,7 +5920,7 @@ x_create_bitmap_from_xpm_data (struct frame *f, const char **bits)
 /* Load image IMG which will be displayed on frame F.  Value is
    true if successful.  */
 
-#if defined HAVE_XPM && !defined USE_CAIRO
+#if defined HAVE_XPM && !defined USE_CAIRO && !defined USE_SKIA
 
 static bool
 xpm_load (struct frame *f, struct image *img)
@@ -6073,9 +6229,10 @@ xpm_load (struct frame *f, struct image *img)
   return rc == XpmSuccess;
 }
 
-#endif /* HAVE_XPM && !USE_CAIRO */
+#endif /* HAVE_XPM && !USE_CAIRO && !USE_SKIA */
 
 #if (defined USE_CAIRO && defined HAVE_XPM)	\
+  || (defined USE_SKIA && defined HAVE_XPM)	\
   || (defined HAVE_NS && !defined HAVE_XPM)	\
   || (defined HAVE_HAIKU && !defined HAVE_XPM)  \
   || (defined HAVE_PGTK && !defined HAVE_XPM)	\
@@ -6472,7 +6629,7 @@ xpm_load_image (struct frame *f,
     }
 
   unsigned long frame_fg = FRAME_FOREGROUND_PIXEL (f);
-#ifdef USE_CAIRO
+#if defined USE_CAIRO || defined USE_SKIA
   {
     Emacs_Color color = {.pixel = frame_fg};
     FRAME_TERMINAL (f)->query_colors (f, &color, 1);
@@ -6582,7 +6739,7 @@ xpm_load (struct frame *f,
   return success_p;
 }
 
-#endif /* HAVE_NS && !HAVE_XPM */
+#endif /* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_HAIKU || HAVE_PGTK || HAVE_ANDROID (internal XPM parser) */
 
 
 
@@ -6843,8 +7000,8 @@ lookup_rgb_color (struct frame *f, int r, int g, int b)
 {
 #ifdef HAVE_NTGUI
   return PALETTERGB (r >> 8, g >> 8, b >> 8);
-#elif defined USE_CAIRO || defined HAVE_NS || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID
+#elif defined USE_CAIRO || defined USE_SKIA || defined HAVE_NS	\
+  || defined HAVE_HAIKU || defined HAVE_ANDROID
   return RGB_TO_ULONG (r >> 8, g >> 8, b >> 8);
 #else
   xsignal1 (Qfile_error,
@@ -6917,8 +7074,8 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
   p = colors;
   for (y = 0; y < img->height; ++y)
     {
-#if !defined USE_CAIRO && !defined HAVE_NS && !defined HAVE_HAIKU	\
-  && !defined HAVE_ANDROID
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_NS	\
+  && !defined HAVE_HAIKU && !defined HAVE_ANDROID
       Emacs_Color *row = p;
       for (x = 0; x < img->width; ++x, ++p)
 	p->pixel = GET_PIXEL (ximg, x, y);
@@ -6926,7 +7083,7 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
         {
           FRAME_TERMINAL (f)->query_colors (f, row, img->width);
         }
-#else  /* USE_CAIRO || HAVE_NS || HAVE_HAIKU || HAVE_ANDROID */
+#else  /* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_HAIKU || HAVE_ANDROID */
       for (x = 0; x < img->width; ++x, ++p)
 	{
 	  p->pixel = GET_PIXEL (ximg, x, y);
@@ -6937,7 +7094,7 @@ image_to_emacs_colors (struct frame *f, struct image *img, bool rgb_p)
 	      p->blue = BLUE16_FROM_ULONG (p->pixel);
 	    }
 	}
-#endif	/* USE_CAIRO || HAVE_NS || HAVE_ANDROID */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_NS || HAVE_ANDROID */
     }
 
   image_unget_x_image_or_dc (img, 0, ximg, prev);
@@ -7168,8 +7325,8 @@ image_edge_detection (struct frame *f, struct image *img,
 }
 
 
-#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID
+#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined USE_SKIA \
+  || defined HAVE_HAIKU || defined HAVE_ANDROID
 
 static void
 image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
@@ -7196,6 +7353,29 @@ image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
   cairo_set_line_width (cr, 1);
   cairo_stroke (cr);
   cairo_destroy (cr);
+#elif defined USE_SKIA
+  /* For Skia without Cairo, draw the cross directly on the pixel data.  */
+  if (pixmap && pixmap->data && pixmap->bits_per_pixel == 32)
+    {
+      uint32_t *data = (uint32_t *) pixmap->data;
+      int stride = pixmap->bytes_per_line / 4;
+      uint32_t pixel = 0xFF000000 | (color & 0xFFFFFF); /* ARGB */
+
+      /* Draw diagonal line from top-left to bottom-right.  */
+      for (unsigned int i = 0; i < width && i < height; i++)
+	{
+	  int px = x + i, py = y + i;
+	  if (px >= 0 && px < pixmap->width && py >= 0 && py < pixmap->height)
+	    data[py * stride + px] = pixel;
+	}
+      /* Draw diagonal line from bottom-left to top-right.  */
+      for (unsigned int i = 0; i < width && i < height; i++)
+	{
+	  int px = x + i, py = y + height - 1 - i;
+	  if (px >= 0 && px < pixmap->width && py >= 0 && py < pixmap->height)
+	    data[py * stride + px] = pixel;
+	}
+    }
 #elif HAVE_X_WINDOWS
   Display *dpy = FRAME_X_DISPLAY (f);
   GC gc = XCreateGC (dpy, pixmap, 0, NULL);
@@ -7264,17 +7444,17 @@ image_disable_image (struct frame *f, struct image *img)
 #ifndef HAVE_NTGUI
 #ifndef HAVE_NS  /* TODO: NS support, however this not needed for toolbars */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU && !defined HAVE_ANDROID
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU && !defined HAVE_ANDROID
 #define CrossForeground(f) BLACK_PIX_DEFAULT (f)
 #define MaskForeground(f)  WHITE_PIX_DEFAULT (f)
-#else  /* USE_CAIRO || HAVE_HAIKU */
+#else  /* USE_CAIRO || USE_SKIA || HAVE_HAIKU */
 #define CrossForeground(f) 0
 #define MaskForeground(f)  PIX_MASK_DRAW
-#endif	/* USE_CAIRO || HAVE_HAIKU */
+#endif	/* USE_CAIRO || USE_SKIA || HAVE_HAIKU */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU
+#if !defined USE_CAIRO && !defined USE_SKIA && !defined HAVE_HAIKU
       image_sync_to_pixmaps (f, img);
-#endif	/* !USE_CAIRO && !HAVE_HAIKU */
+#endif	/* !USE_CAIRO && !USE_SKIA && !HAVE_HAIKU */
       image_pixmap_draw_cross (f, img->pixmap, 0, 0, img->width, img->height,
 			       CrossForeground (f));
       if (img->mask)
