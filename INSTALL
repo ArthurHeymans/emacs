@@ -431,6 +431,33 @@ faster when running over X connections with high latency, it is likely
 to crash when a new frame is created on a display connection opened
 after a display connection is closed.
 
+Use --with-skia to compile Emacs with Skia drawing instead of Cairo.
+This option is only available for PGTK builds (--with-pgtk) and provides
+GPU-accelerated rendering via OpenGL.  Skia is Google's 2D graphics
+library used in Chrome and Android.  Skia must be built and installed
+separately before configuring Emacs.
+
+  To obtain Skia:
+    git clone https://skia.googlesource.com/skia.git
+    cd skia
+    python3 tools/git-sync-deps
+
+  To build Skia (example for Linux):
+    bin/gn gen out/Release --args='is_official_build=true skia_use_system_freetype2=true'
+    ninja -C out/Release
+
+  Set environment variables to point to your Skia installation:
+    export SKIA_DIR=/path/to/skia
+    export SKIA_CFLAGS="-I$SKIA_DIR/include -I$SKIA_DIR"
+    export SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+
+  Alternatively, if using the Nix package manager, the repository's
+  flake.nix provides a development shell with Skia pre-configured:
+    nix develop
+
+  Then configure with:
+    ./configure --with-pgtk --with-skia
+
 Use --with-modules to build Emacs with support for dynamic modules.
 This needs a C compiler that supports '__attribute__ ((cleanup (...)))',
 as in GCC 3.4 and later.

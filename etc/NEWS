@@ -55,7 +55,16 @@ collection performance.  Doing so may make it more difficult for Emacs
 developers to help finding GC-related bugs that you run into, which is
 why the mark trace buffer is enabled by default.
 
-
+---
+** New configure option '--with-skia' for GPU-accelerated rendering.
+When configured with '--with-skia', the PGTK build of Emacs uses
+Google's Skia graphics library for all drawing operations instead of
+Cairo.  This provides GPU-accelerated rendering via OpenGL.  Requires
+OpenGL support (libepoxy or libGL) and is mutually exclusive with
+'--with-cairo'.  The Skia library must be installed separately; see
+the INSTALL file for details on obtaining and building Skia.
+
+
 * Startup Changes in Emacs 30.1
 
 ** On GNU/Linux, Emacs is now the default application for 'org-protocol'.
