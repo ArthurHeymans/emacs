@@ -40,12 +40,20 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include <cairo-svg.h>
 #endif
 
+# ifdef USE_SKIA
+#  include "skia/emacs_skia.h"
+# endif
+
 struct pgtk_bitmap_record
 {
   char *file;
   int refcount;
   int height, width, depth;
+# ifdef USE_SKIA
+  emacs_skia_image_t *skia_image;
+# else
   cairo_pattern_t *pattern;
+# endif
 };
 
 struct pgtk_device_t
@@ -412,12 +420,33 @@ struct pgtk_output
      Zero if not using an external tool bar or if tool bar is horizontal.  */
   int toolbar_left_width, toolbar_right_width;
 
-#ifdef USE_CAIRO
-  /* Cairo drawing contexts.  */
+#if defined (USE_CAIRO) || defined (USE_SKIA)
+  /* Cairo drawing contexts (also used for PDF/SVG export with Skia).  */
   cairo_t *cr_context, *cr_active;
   int cr_surface_desired_width, cr_surface_desired_height;
+#endif
+#ifdef USE_CAIRO
   /* Cairo surface for double buffering */
   cairo_surface_t *cr_surface_visible_bell;
+#endif
+#ifdef USE_SKIA
+  /* Skia drawing contexts.  */
+  emacs_skia_surface_t *skia_surface;
+  emacs_skia_canvas_t *skia_canvas;
+  emacs_skia_gl_context_t *skia_gl_context;
+  int skia_surface_desired_width, skia_surface_desired_height;
+  emacs_skia_paint_t *skia_paint; /* Reusable paint object */
+  emacs_skia_surface_t *skia_surface_visible_bell;
+  bool skia_gl_initialized;
+  /* Skia GL rendering support.  */
+  GtkWidget *gl_area;
+  GdkGLContext *gdk_gl_context;
+  unsigned int gl_framebuffer;
+  unsigned int gl_texture;
+  unsigned int gl_stencil;
+  gint64 last_render_time;
+  /* Track when GL state needs reset - avoids unnecessary resetContext calls.  */
+  bool skia_gl_state_dirty;
 #endif
   struct atimer *atimer_visible_bell;
 
@@ -523,10 +552,33 @@ enum
   (! (FRAME_HAS_VERTICAL_SCROLL_BARS_ON_LEFT (f)) ? 0	\
    : FRAME_SCROLL_BAR_COLS (f))
 
+#if defined (USE_CAIRO) || defined (USE_SKIA)
 #define FRAME_CR_SURFACE_DESIRED_WIDTH(f)		\
   ((f)->output_data.pgtk->cr_surface_desired_width)
 #define FRAME_CR_SURFACE_DESIRED_HEIGHT(f) \
   ((f)->output_data.pgtk->cr_surface_desired_height)
+#endif
+
+#ifdef USE_SKIA
+# define FRAME_SKIA_SURFACE(f) ((f)->output_data.pgtk->skia_surface)
+# define FRAME_SKIA_CANVAS(f) ((f)->output_data.pgtk->skia_canvas)
+# define FRAME_SKIA_GL_CONTEXT(f) \
+    ((f)->output_data.pgtk->skia_gl_context)
+# define FRAME_SKIA_PAINT(f) ((f)->output_data.pgtk->skia_paint)
+# define FRAME_SKIA_SURFACE_DESIRED_WIDTH(f) \
+    ((f)->output_data.pgtk->skia_surface_desired_width)
+# define FRAME_SKIA_SURFACE_DESIRED_HEIGHT(f) \
+    ((f)->output_data.pgtk->skia_surface_desired_height)
+# define FRAME_SKIA_GL_INITIALIZED(f) \
+     ((f)->output_data.pgtk->skia_gl_initialized)
+# define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
+# define FRAME_GDK_GL_CONTEXT(f) ((f)->output_data.pgtk->gdk_gl_context)
+# define FRAME_GL_FRAMEBUFFER(f) ((f)->output_data.pgtk->gl_framebuffer)
+# define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
+# define FRAME_GL_STENCIL(f) ((f)->output_data.pgtk->gl_stencil)
+# define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
+# define FRAME_SKIA_GL_STATE_DIRTY(f) ((f)->output_data.pgtk->skia_gl_state_dirty)
+#endif
 
 
 /* If a struct input_event has a kind which is SELECTION_REQUEST_EVENT
@@ -607,7 +659,9 @@ extern void pgtk_set_no_focus_on_map (struct frame *, Lisp_Object, Lisp_Object);
 extern void pgtk_set_no_accept_focus (struct frame *, Lisp_Object, Lisp_Object);
 extern void pgtk_set_z_group (struct frame *, Lisp_Object, Lisp_Object);
 
-/* Cairo related functions implemented in pgtkterm.c */
+#if defined (USE_CAIRO) || defined (USE_SKIA)
+/* Cairo related functions implemented in pgtkterm.c
+   (also needed as bridge for Skia rendering to GTK).  */
 extern void pgtk_cr_update_surface_desired_size (struct frame *, int, int, bool);
 extern cairo_t *pgtk_begin_cr_clip (struct frame *);
 extern void pgtk_end_cr_clip (struct frame *);
@@ -617,6 +671,20 @@ extern void pgtk_set_cr_source_with_color (struct frame *, unsigned long, bool);
 extern void pgtk_cr_draw_frame (cairo_t *, struct frame *);
 extern void pgtk_cr_destroy_frame_context (struct frame *);
 extern Lisp_Object pgtk_cr_export_frames (Lisp_Object , cairo_surface_type_t);
+#endif
+
+#ifdef USE_SKIA
+/* Skia related functions implemented in pgtkterm.c */
+extern void pgtk_skia_update_surface_desired_size (struct frame *, int, int, bool);
+extern emacs_skia_canvas_t *pgtk_begin_skia_clip (struct frame *);
+extern void pgtk_end_skia_clip (struct frame *);
+extern void pgtk_skia_set_paint_foreground (struct frame *, Emacs_GC *);
+extern void pgtk_skia_set_paint_background (struct frame *, Emacs_GC *);
+extern void pgtk_skia_set_paint_color (struct frame *, unsigned long, bool);
+extern void pgtk_skia_draw_frame (struct frame *);
+extern Lisp_Object pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type);
+extern void pgtk_skia_destroy_frame_context (struct frame *);
+#endif
 
 /* Defined in pgtkmenu.c */
 extern Lisp_Object pgtk_popup_dialog (struct frame *, Lisp_Object, Lisp_Object);
