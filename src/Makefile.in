@@ -393,6 +393,10 @@ HAIKU_CXX_OBJ = @HAIKU_CXX_OBJ@
 HAIKU_LIBS = @HAIKU_LIBS@
 HAIKU_CFLAGS = @HAIKU_CFLAGS@
 
+SKIA_CXX_OBJ = @SKIA_CXX_OBJ@
+SKIA_CFLAGS = @SKIA_CFLAGS@
+SKIA_LIBS = @SKIA_LIBS@
+
 ANDROID_OBJ = @ANDROID_OBJ@
 ANDROID_LIBS = @ANDROID_LIBS@
 ANDROID_LDFLAGS = @ANDROID_LDFLAGS@
@@ -405,6 +409,7 @@ CHECK_STRUCTS = @CHECK_STRUCTS@
 HAVE_PDUMPER = @HAVE_PDUMPER@
 
 HAVE_BE_APP = @HAVE_BE_APP@
+HAVE_SKIA = @HAVE_SKIA@
 
 ## ARM Macs require that all code have a valid signature.  Since pdump
 ## invalidates the signature, we must re-sign to fix it.
@@ -452,12 +457,14 @@ ALL_OBJC_CFLAGS = $(EMACS_CFLAGS) \
 ALL_CXX_CFLAGS = $(EMACS_CFLAGS) \
   $(filter-out $(NON_CXX_CFLAGS),$(WARN_CFLAGS)) $(CXXFLAGS)
 
-.SUFFIXES: .c .m .cc
+.SUFFIXES: .c .m .cc .cpp
 .c.o:
 	$(AM_V_CC)$(CC) -c $(CPPFLAGS) $(ALL_CFLAGS) $(PROFILING_CFLAGS) $<
 .m.o:
 	$(AM_V_CC)$(CC) -c $(CPPFLAGS) $(ALL_OBJC_CFLAGS) $(PROFILING_CFLAGS) $<
 .cc.o:
+	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(PROFILING_CFLAGS) $<
+.cpp.o:
 	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(PROFILING_CFLAGS) $<
 
 ## lastfile must follow all files whose initialized data areas should
@@ -484,7 +491,7 @@ base_obj = dispnew.o frame.o scroll.o xdisp.o menu.o $(XMENU_OBJ) window.o     \
 	$(W32_OBJ) $(WINDOW_SYSTEM_OBJ) $(XGSELOBJ)			       \
 	$(HAIKU_OBJ) $(PGTK_OBJ) $(ANDROID_OBJ)
 doc_obj = $(base_obj) $(NS_OBJC_OBJ)
-obj = $(doc_obj) $(HAIKU_CXX_OBJ)
+obj = $(doc_obj) $(HAIKU_CXX_OBJ) $(SKIA_CXX_OBJ)
 
 ## Object files used on some machine or other.
 ## These go in the DOC file on all machines in case they are needed.
@@ -601,7 +608,7 @@ LIBES = $(LIBS) $(W32_LIBS) $(LIBS_GNUSTEP) $(PGTK_LIBS) $(LIBX_BASE) $(LIBIMAGE
    $(EUIDACCESS_LIBGEN) $(TIMER_TIME_LIB) $(DBUS_LIBS) \
    $(LIB_EXECINFO) $(XRANDR_LIBS) $(XINERAMA_LIBS) $(XFIXES_LIBS) \
    $(XDBE_LIBS) $(XSYNC_LIBS) \
-   $(LIBXML2_LIBS) $(LIBGPM) $(LIBS_SYSTEM) $(CAIRO_LIBS) \
+   $(LIBXML2_LIBS) $(LIBGPM) $(LIBS_SYSTEM) $(CAIRO_LIBS) $(SKIA_LIBS) \
    $(LIBS_TERMCAP) $(GETLOADAVG_LIBS) $(SETTINGS_LIBS) $(LIBSELINUX_LIBS) \
    $(FREETYPE_LIBS) $(FONTCONFIG_LIBS) $(HARFBUZZ_LIBS) $(LIBOTF_LIBS) $(M17N_FLT_LIBS) \
    $(LIBGNUTLS_LIBS) $(LIB_PTHREAD) $(GETADDRINFO_A_LIBS) $(LCMS2_LIBS) \
@@ -720,6 +727,15 @@ globals.h: gl-stamp; @true
 
 $(ALLOBJS): globals.h
 
+## Skia C++ wrapper
+ifneq ($(SKIA_CXX_OBJ),)
+skia:
+	$(MKDIR_P) skia
+
+skia/emacs_skia.o: $(srcdir)/skia/emacs_skia.cpp skia $(config_h)
+	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(SKIA_CFLAGS) -o $@ $<
+endif
+
 LIBEGNU_ARCHIVE = $(lib)/lib$(if $(HYBRID_MALLOC),e)gnu.a
 
 $(LIBEGNU_ARCHIVE): $(config_h)
@@ -738,6 +754,10 @@ endif
 temacs$(EXEEXT): $(LIBXMENU) $(ALLOBJS) $(LIBEGNU_ARCHIVE) $(EMACSRES) \
   $(charsets) $(charscript) ${emoji-zwj} $(MAKE_PDUMPER_FINGERPRINT)
 ifeq ($(HAVE_BE_APP),yes)
+	$(AM_V_CXXLD)$(CXX) -o $@.tmp \
+	  $(ALL_CFLAGS) $(TEMACS_LDFLAGS) $(LDFLAGS) \
+	  $(ALLOBJS) $(LIBEGNU_ARCHIVE) $(W32_RES_LINK) $(LIBES) -lstdc++
+else ifeq ($(HAVE_SKIA),yes)
 	$(AM_V_CXXLD)$(CXX) -o $@.tmp \
 	  $(ALL_CFLAGS) $(TEMACS_LDFLAGS) $(LDFLAGS) \
 	  $(ALLOBJS) $(LIBEGNU_ARCHIVE) $(W32_RES_LINK) $(LIBES) -lstdc++
@@ -831,6 +851,7 @@ ns-app: emacs$(EXEEXT) $(pdmp)
 mostlyclean:
 	rm -f android-emacs libemacs.so
 	rm -f temacs$(EXEEXT) core ./*.core \#* ./*.o build-counter.c
+	rm -f skia/*.o
 	rm -f dmpstruct.h
 	rm -f emacs.pdmp
 	rm -f ../etc/DOC

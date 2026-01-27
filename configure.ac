@@ -551,6 +551,7 @@ OPTION_DEFAULT_ON([lcms2],[don't compile with Little CMS support])
 OPTION_DEFAULT_ON([libsystemd],[don't compile with libsystemd support])
 OPTION_DEFAULT_ON([cairo],[don't compile with Cairo drawing])
 OPTION_DEFAULT_OFF([cairo-xcb], [use XCB surfaces for Cairo support])
+OPTION_DEFAULT_OFF([skia],[use Skia for GPU-accelerated drawing (experimental)])
 OPTION_DEFAULT_ON([xml2],[don't compile with XML parsing support])
 OPTION_DEFAULT_OFF([imagemagick],[compile with ImageMagick image support])
 OPTION_DEFAULT_ON([native-image-api], [don't use native image APIs (GDI+ on Windows)])
@@ -4427,7 +4428,8 @@ fi
 
 HAVE_CAIRO=no
 if test "${HAVE_X11}" = "yes"; then
-  if test "${with_cairo}" != "no"; then
+  dnl Skip Cairo check if Skia is explicitly enabled (Skia replaces Cairo)
+  if test "${with_cairo}" != "no" && test "${with_skia}" != "yes"; then
     CAIRO_REQUIRED=1.8.0
     CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
     EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
@@ -4467,7 +4469,8 @@ if test "$with_xwidgets" != "no"; then
     fi
     HAVE_XWIDGETS=$HAVE_WEBKIT
     XWIDGETS_OBJ="xwidget.o"
-    if test "$HAVE_X_WINDOWS" = "yes" && test "${with_cairo}" = "no"; then
+    dnl xwidgets on X11 requires cairo-xlib for compositing, even when using Skia
+    if test "$HAVE_X_WINDOWS" = "yes" && test "$HAVE_CAIRO" != "yes"; then
       CAIRO_XLIB_MODULES="cairo >= 1.8.0 cairo-xlib >= 1.8.0"
       EMACS_CHECK_MODULES([CAIRO_XLIB], [$CAIRO_XLIB_MODULES])
       if test $HAVE_CAIRO_XLIB = "yes"; then
@@ -4501,20 +4504,149 @@ if test "$with_xwidgets" != "no"; then
 fi
 AC_SUBST([XWIDGETS_OBJ])
 
-if test "$window_system" = "pgtk"; then
-  CAIRO_REQUIRED=1.12.0
-  CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
-  EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
-  if test $HAVE_CAIRO = yes; then
-    AC_DEFINE([USE_CAIRO], [1], [Define to 1 if using cairo.])
+dnl Skia support (experimental, for PGTK)
+HAVE_SKIA=no
+if test "${with_skia}" = "yes"; then
+  dnl Check for Skia library
+  AC_MSG_CHECKING([for Skia])
+
+  dnl Allow user to specify paths via environment variables
+  AC_ARG_VAR([SKIA_DIR], [Path to Skia source/installation])
+  AC_ARG_VAR([SKIA_CFLAGS], [C compiler flags for Skia])
+  AC_ARG_VAR([SKIA_LIBS], [linker flags for Skia])
+
+  dnl First check if SKIA_CFLAGS and SKIA_LIBS are already set (e.g., from Nix)
+  if test -n "$SKIA_CFLAGS" && test -n "$SKIA_LIBS"; then
+    HAVE_SKIA=yes
   else
-    AC_MSG_ERROR([cairo required but not found.])
+    dnl Try pkg-config
+    PKG_CHECK_EXISTS([skia], [
+      PKG_CHECK_MODULES([SKIA], [skia], [HAVE_SKIA=yes], [HAVE_SKIA=no])
+    ], [
+      dnl Manual detection - check for header file existence
+      if test -n "$SKIA_DIR"; then
+        dnl Check for Nix-style layout (include/skia/core/SkCanvas.h)
+        if test -f "$SKIA_DIR/include/skia/core/SkCanvas.h"; then
+          HAVE_SKIA=yes
+          SKIA_CFLAGS="-I$SKIA_DIR/include/skia"
+          if test -f "$SKIA_DIR/lib/libskia.so"; then
+            SKIA_LIBS="-L$SKIA_DIR/lib -lskia"
+          else
+            SKIA_LIBS="-lskia"
+          fi
+        dnl Check for source-build layout (include/core/SkCanvas.h)
+        elif test -f "$SKIA_DIR/include/core/SkCanvas.h"; then
+          HAVE_SKIA=yes
+          SKIA_CFLAGS="-I$SKIA_DIR"
+          if test -f "$SKIA_DIR/out/Release/libskia.a"; then
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+          elif test -f "$SKIA_DIR/out/Release/libskia.so"; then
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+          else
+            SKIA_LIBS="-L$SKIA_DIR/out/Release -lskia"
+            AC_MSG_WARN([Skia library not found at $SKIA_DIR/out/Release - you need to build Skia first])
+          fi
+        else
+          HAVE_SKIA=no
+        fi
+      else
+        dnl Try system paths
+        save_CPPFLAGS="$CPPFLAGS"
+        AC_CHECK_HEADER([skia/core/SkCanvas.h], [
+          HAVE_SKIA=yes
+          SKIA_CFLAGS=""
+          SKIA_LIBS="-lskia"
+        ], [HAVE_SKIA=no])
+        CPPFLAGS="$save_CPPFLAGS"
+      fi
+    ])
   fi
 
-  CFLAGS="$CFLAGS $CAIRO_CFLAGS"
-  LIBS="$LIBS $CAIRO_LIBS"
-  AC_SUBST([CAIRO_CFLAGS])
-  AC_SUBST([CAIRO_LIBS])
+  if test "$HAVE_SKIA" = "yes"; then
+    AC_DEFINE([USE_SKIA], [1], [Define to 1 if using Skia for drawing.])
+    CFLAGS="$CFLAGS $SKIA_CFLAGS"
+    CXXFLAGS="$CXXFLAGS $SKIA_CFLAGS"
+    dnl Ensure we link with C++ standard library
+    case "$SKIA_LIBS" in
+      *-lstdc++*) ;;
+      *) SKIA_LIBS="$SKIA_LIBS -lstdc++" ;;
+    esac
+
+    dnl Auto-detect OpenGL support for Skia GPU acceleration
+    dnl We use libepoxy which GTK3 already depends on
+    dnl SK_GANESH is required by Skia to enable the Ganesh GPU backend,
+    dnl without it SK_GL gets undefined by SkTypes.h
+    HAVE_SKIA_GL=no
+    AC_MSG_CHECKING([for OpenGL support (libepoxy) for Skia GPU acceleration])
+    PKG_CHECK_EXISTS([epoxy], [
+      PKG_CHECK_MODULES([EPOXY], [epoxy], [
+        HAVE_SKIA_GL=yes
+        AC_DEFINE([SK_GL], [1], [Define to 1 if Skia GL backend is available.])
+        AC_DEFINE([SK_GANESH], [1], [Define to 1 to enable Skia Ganesh GPU backend.])
+        SKIA_CFLAGS="$SKIA_CFLAGS -DSK_GL=1 -DSK_GANESH=1 $EPOXY_CFLAGS"
+        SKIA_LIBS="$SKIA_LIBS $EPOXY_LIBS"
+        AC_MSG_RESULT([yes])
+      ], [
+        AC_MSG_RESULT([no (libepoxy not usable)])
+      ])
+    ], [
+      dnl Try direct GL detection as fallback
+      AC_CHECK_LIB([GL], [glClear], [
+        HAVE_SKIA_GL=yes
+        AC_DEFINE([SK_GL], [1], [Define to 1 if Skia GL backend is available.])
+        AC_DEFINE([SK_GANESH], [1], [Define to 1 to enable Skia Ganesh GPU backend.])
+        SKIA_CFLAGS="$SKIA_CFLAGS -DSK_GL=1 -DSK_GANESH=1"
+        SKIA_LIBS="$SKIA_LIBS -lGL"
+        AC_MSG_RESULT([yes (direct libGL)])
+      ], [
+        AC_MSG_RESULT([no])
+      ])
+    ])
+
+    dnl OpenGL is required for Skia - fail if not found
+    if test "$HAVE_SKIA_GL" != "yes"; then
+      AC_MSG_ERROR([Skia backend requires OpenGL support (libepoxy or libGL). Install libepoxy-dev or mesa-dev.])
+    fi
+    AC_SUBST([HAVE_SKIA_GL])
+
+    AC_SUBST([SKIA_CFLAGS])
+    AC_SUBST([SKIA_LIBS])
+    AC_MSG_RESULT([yes])
+  else
+    AC_MSG_RESULT([no])
+    AC_MSG_WARN([Skia requested but not found. Install Skia or set SKIA_DIR/SKIA_CFLAGS/SKIA_LIBS.])
+  fi
+fi
+AC_SUBST([HAVE_SKIA])
+
+dnl Skia C++ objects (must come after HAVE_SKIA is set)
+SKIA_CXX_OBJ=
+if test "$HAVE_SKIA" = "yes"; then
+  SKIA_CXX_OBJ="skia/emacs_skia.o"
+fi
+AC_SUBST([SKIA_CXX_OBJ])
+
+if test "$window_system" = "pgtk"; then
+  dnl For PGTK, either Cairo or Skia is required
+  if test "$HAVE_SKIA" = "yes"; then
+    dnl Using Skia for PGTK
+    AC_MSG_NOTICE([Using Skia for PGTK rendering])
+  else
+    dnl Fall back to Cairo
+    CAIRO_REQUIRED=1.12.0
+    CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
+    EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
+    if test $HAVE_CAIRO = yes; then
+      AC_DEFINE([USE_CAIRO], [1], [Define to 1 if using cairo.])
+    else
+      AC_MSG_ERROR([Either cairo or skia required for PGTK but neither found.])
+    fi
+
+    CFLAGS="$CFLAGS $CAIRO_CFLAGS"
+    LIBS="$LIBS $CAIRO_LIBS"
+    AC_SUBST([CAIRO_CFLAGS])
+    AC_SUBST([CAIRO_LIBS])
+  fi
 fi
 
 if test "${HAVE_BE_APP}" = "yes"; then
@@ -4540,19 +4672,27 @@ fi
 
 ### Start of font-backend (under X11) section.
 if test "${HAVE_X11}" = "yes"; then
-  if test $HAVE_CAIRO = yes; then
+  if test "$HAVE_SKIA" = "yes" || test "$HAVE_CAIRO" = "yes"; then
+    dnl Skia and Cairo both use ftfont, which requires freetype/fontconfig.
     dnl Strict linkers fail with
     dnl ftfont.o: undefined reference to symbol 'FT_New_Face'
     dnl if -lfreetype is not specified.
     dnl The following is needed to set FREETYPE_LIBS.
     EMACS_CHECK_MODULES([FREETYPE], [freetype2])
 
-    test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([cairo requires libfreetype])
+    if test "$HAVE_SKIA" = "yes"; then
+      test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([skia requires libfreetype])
+    else
+      test "$HAVE_FREETYPE" = "no" && AC_MSG_ERROR([cairo requires libfreetype])
+    fi
 
     EMACS_CHECK_MODULES([FONTCONFIG], [fontconfig >= 2.2.0])
 
-    test "$HAVE_FONTCONFIG" = "no" &&
-      AC_MSG_ERROR([cairo requires libfontconfig])
+    if test "$HAVE_SKIA" = "yes"; then
+      test "$HAVE_FONTCONFIG" = "no" && AC_MSG_ERROR([skia requires libfontconfig])
+    else
+      test "$HAVE_FONTCONFIG" = "no" && AC_MSG_ERROR([cairo requires libfontconfig])
+    fi
     dnl For the "Does Emacs use" message at the end.
     HAVE_XFT=no
   else
@@ -4619,6 +4759,10 @@ if test "${HAVE_X11}" = "yes"; then
   if test "${HAVE_FREETYPE}" = "yes"; then
     AC_DEFINE([HAVE_FREETYPE], [1],
 	      [Define to 1 if using the freetype and fontconfig libraries.])
+    if test "${HAVE_FONTCONFIG}" = "yes"; then
+      AC_DEFINE([HAVE_FONTCONFIG], [1],
+		[Define to 1 if using the fontconfig library.])
+    fi
     OLD_CFLAGS=$CFLAGS
     OLD_LIBS=$LIBS
     CFLAGS="$CFLAGS $FREETYPE_CFLAGS"
@@ -4666,6 +4810,8 @@ else # "${HAVE_X11}" != "yes"
     HAVE_LIBOTF=no
     AC_DEFINE([HAVE_FREETYPE], [1],
 	      [Define to 1 if using the freetype and fontconfig libraries.])
+    AC_DEFINE([HAVE_FONTCONFIG], [1],
+	      [Define to 1 if using the fontconfig library.])
     if test "${with_libotf}" != "no"; then
       EMACS_CHECK_MODULES([LIBOTF], [libotf])
       if test "$HAVE_LIBOTF" = "yes"; then
@@ -7200,6 +7346,7 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
   XMENU_OBJ=xmenu.o
   XOBJ="xterm.o xfns.o xselect.o xrdb.o xsmfns.o xsettings.o"
   FONT_OBJ=xfont.o
+  dnl Note: skiafont.o added in later commit; for now Skia falls through to Cairo fonts
   if test "$HAVE_CAIRO" = "yes"; then
     FONT_OBJ="$FONT_OBJ ftfont.o ftcrfont.o"
   elif test "$HAVE_XFT" = "yes"; then
@@ -7210,6 +7357,7 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
 fi
 
 if test "${window_system}" = "pgtk"; then
+   dnl Note: skiafont.o added in later commit; for now use ftcrfont.o
    FONT_OBJ="ftfont.o ftcrfont.o"
 fi
 
@@ -7740,6 +7888,7 @@ AS_ECHO(["  Does Emacs use -lXaw3d?                                 ${HAVE_XAW3D
   Does Emacs use -lwebp?                                  ${HAVE_WEBP}
   Does Emacs use -lsqlite3?                               ${HAVE_SQLITE3}
   Does Emacs use cairo?                                   ${HAVE_CAIRO}
+  Does Emacs use skia?                                    ${HAVE_SKIA}
   Does Emacs use -llcms2?                                 ${HAVE_LCMS2}
   Does Emacs use imagemagick?                             ${HAVE_IMAGEMAGICK}
   Does Emacs use native APIs for images?                  ${NATIVE_IMAGE_API}
