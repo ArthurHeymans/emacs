@@ -48,7 +48,16 @@ incorrectly in rare cases.
 This allows to specify the directory where the user unit file for
 systemd is installed; default is '${prefix}/usr/lib/systemd/user'.
 
-
+---
+** New configure option '--with-skia' for GPU-accelerated rendering.
+When configured with '--with-skia', the PGTK build of Emacs uses
+Google's Skia graphics library for all drawing operations instead of
+Cairo.  This provides GPU-accelerated rendering via OpenGL.  Requires
+OpenGL support (libepoxy or libGL) and is mutually exclusive with
+'--with-cairo'.  The Skia library must be installed separately; see
+the INSTALL file for details on obtaining and building Skia.
+
+
 * Startup Changes in Emacs 31.1
 
 ** In compatible terminals, 'xterm-mouse-mode' is turned on by default.
