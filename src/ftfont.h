@@ -76,6 +76,13 @@ struct font_info
   /* Font metrics cache.  */
   struct font_metrics **metrics;
   short metrics_nrows;
+/* USE_SKIA uses pure Skia + FreeType for font rendering.  */
+#elif defined (USE_SKIA)
+  /* Pure Skia path: use FreeType directly for FT_Face access.  */
+  FT_Face ft_face;	/* Direct FreeType face for metrics.  */
+  double bitmap_position_unit;
+  struct font_metrics **metrics;
+  short metrics_nrows;
 #else
   /* These are used by the XFT backend.  */
   Display *display;

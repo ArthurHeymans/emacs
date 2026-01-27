@@ -38,7 +38,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 typedef XColor Emacs_Color;
 typedef Cursor Emacs_Cursor;
 #define No_Cursor (None)
-#ifndef USE_CAIRO
+#if !defined (USE_CAIRO) && !defined (USE_SKIA)
 typedef Pixmap Emacs_Pixmap;
 #endif
 typedef XRectangle Emacs_Rectangle;
@@ -113,14 +113,14 @@ xstrcasecmp (char const *a, char const *b)
 #ifdef HAVE_X_WINDOWS
 #include <X11/Xresource.h> /* for XrmDatabase */
 typedef struct x_display_info Display_Info;
-#ifndef USE_CAIRO
+#if !defined (USE_CAIRO) && !defined (USE_SKIA)
 typedef XImage *Emacs_Pix_Container;
 typedef XImage *Emacs_Pix_Context;
-#endif	/* !USE_CAIRO */
+#endif	/* !USE_CAIRO && !USE_SKIA */
 #define NativeRectangle XRectangle
 #endif
 
-#ifdef USE_CAIRO
+#if defined (USE_CAIRO) || defined (USE_SKIA)
 /* Minimal version of XImage.  */
 typedef struct
 {
@@ -3166,9 +3166,8 @@ struct redisplay_interface
 
 #ifdef HAVE_WINDOW_SYSTEM
 
-# if (defined USE_CAIRO || defined HAVE_XRENDER				\
-      || defined HAVE_NS || defined HAVE_NTGUI || defined HAVE_HAIKU	\
-      || defined HAVE_ANDROID)
+# if (defined HAVE_X_WINDOWS || defined USE_CAIRO || defined USE_SKIA \
+     || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_ANDROID)
 #  define HAVE_NATIVE_TRANSFORMS
 # endif
 
@@ -3187,6 +3186,12 @@ struct image
 
 #ifdef USE_CAIRO
   void *cr_data;
+#endif
+#ifdef USE_SKIA
+  /* Skia image for this image (separate from cr_data for hybrid builds).  */
+  void *skia_data;
+  /* Skia image transformation (for rotation/scaling).  */
+  void *skia_transform;
 #endif
 #ifdef HAVE_X_WINDOWS
   /* X images of the image, corresponding to the above Pixmaps.
@@ -3712,8 +3717,8 @@ void prepare_image_for_display (struct frame *, struct image *);
 ptrdiff_t lookup_image (struct frame *, Lisp_Object, int);
 Lisp_Object image_spec_value (Lisp_Object, Lisp_Object, bool *);
 
-#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_NS \
-  || defined HAVE_HAIKU || defined HAVE_ANDROID
+#if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined USE_SKIA \
+  || defined HAVE_NS || defined HAVE_HAIKU || defined HAVE_ANDROID
 #define RGB_PIXEL_COLOR unsigned long
 #endif
 
