@@ -7349,8 +7349,9 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
   XMENU_OBJ=xmenu.o
   XOBJ="xterm.o xfns.o xselect.o xrdb.o xsmfns.o xsettings.o"
   FONT_OBJ=xfont.o
-  dnl Note: skiafont.o added in later commit; for now Skia falls through to Cairo fonts
-  if test "$HAVE_CAIRO" = "yes"; then
+  if test "$HAVE_SKIA" = "yes"; then
+    FONT_OBJ="$FONT_OBJ ftfont.o skiafont.o"
+  elif test "$HAVE_CAIRO" = "yes"; then
     FONT_OBJ="$FONT_OBJ ftfont.o ftcrfont.o"
   elif test "$HAVE_XFT" = "yes"; then
     FONT_OBJ="$FONT_OBJ ftfont.o xftfont.o"
@@ -7360,8 +7361,11 @@ if test "${HAVE_X_WINDOWS}" = "yes" ; then
 fi
 
 if test "${window_system}" = "pgtk"; then
-   dnl Note: skiafont.o added in later commit; for now use ftcrfont.o
-   FONT_OBJ="ftfont.o ftcrfont.o"
+   if test "${HAVE_SKIA}" = "yes"; then
+     FONT_OBJ="ftfont.o skiafont.o"
+   else
+     FONT_OBJ="ftfont.o ftcrfont.o"
+   fi
 fi
 
 if test "${HAVE_BE_APP}" = "yes" ; then
