@@ -6003,7 +6003,9 @@ match.  */);
   syms_of_ftfont ();
 #ifdef HAVE_X_WINDOWS
   syms_of_xfont ();
-#ifdef USE_CAIRO
+#ifdef USE_SKIA
+  syms_of_skiafont ();
+#elif defined USE_CAIRO
   syms_of_ftcrfont ();
 #else
 #ifdef HAVE_XFT
@@ -6011,7 +6013,9 @@ match.  */);
 #endif  /* HAVE_XFT */
 #endif  /* not USE_CAIRO */
 #else	/* not HAVE_X_WINDOWS */
-#ifdef USE_CAIRO
+#ifdef USE_SKIA
+  syms_of_skiafont ();
+#elif defined USE_CAIRO
   syms_of_ftcrfont ();
 #endif
 #endif	/* not HAVE_X_WINDOWS */
