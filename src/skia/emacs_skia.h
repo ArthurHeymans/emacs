@@ -353,6 +353,15 @@ extern "C"
 				     float x, float y,
 				     emacs_skia_paint_t *paint);
 
+  /* Draw image with explicit sampling control.
+     If smooth is true, use linear filtering (good for scaling down).
+     If smooth is false, use nearest neighbor (shows pixels when scaling up).  */
+  void emacs_skia_canvas_draw_image_with_sampling (emacs_skia_canvas_t *canvas,
+						   emacs_skia_image_t *image,
+						   float x, float y,
+						   bool smooth,
+						   emacs_skia_paint_t *paint);
+
   void emacs_skia_canvas_draw_image_rect (
     emacs_skia_canvas_t *canvas, emacs_skia_image_t *image,
     const emacs_skia_rect_t *src, const emacs_skia_rect_t *dst,

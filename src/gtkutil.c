@@ -510,7 +510,8 @@ xg_get_image_for_pixmap (struct frame *f,
 {
 #ifdef USE_CAIRO
   cairo_surface_t *surface;
-#else
+#endif
+#ifdef HAVE_X_WINDOWS
   GdkPixbuf *icon_buf;
 #endif
 
@@ -567,7 +568,7 @@ xg_get_image_for_pixmap (struct frame *f,
 	}
 #endif	/* !HAVE_GTK3 */
     }
-#else
+#elif defined HAVE_X_WINDOWS
   /* This is a workaround to make icons look good on pseudo color
      displays.  Apparently GTK expects the images to have an alpha
      channel.  If they don't, insensitive and activated icons will
@@ -5670,7 +5671,11 @@ xg_tool_item_stale_p (GtkWidget *wbutton, const char *stock_name,
       void *old_img = (void *) gold_img;
       if (old_img != img->cr_data)
 	return 1;
-#else
+#elif defined USE_SKIA
+      void *old_img = (void *) gold_img;
+      if (old_img != img->skia_data)
+	return 1;
+#elif defined HAVE_X_WINDOWS
       Pixmap old_img = (Pixmap) gold_img;
       if (old_img != img->pixmap)
 	return 1;
@@ -5978,6 +5983,8 @@ update_frame_tool_bar (struct frame *f)
           if (img->load_failed_p
 #ifdef USE_CAIRO
 	      || img->cr_data == NULL
+#elif defined USE_SKIA
+	      || img->skia_data == NULL
 #else
 	      || img->pixmap == None
 #endif
@@ -6036,8 +6043,12 @@ update_frame_tool_bar (struct frame *f)
               g_object_set_data (G_OBJECT (w), XG_TOOL_BAR_IMAGE_DATA,
 #ifdef USE_CAIRO
                                  (gpointer)img->cr_data
-#else
+#elif defined USE_SKIA
+                                 (gpointer)img->skia_data
+#elif defined HAVE_X_WINDOWS
                                  (gpointer)img->pixmap
+#else
+                                 (gpointer)NULL
 #endif
 				 );
             }

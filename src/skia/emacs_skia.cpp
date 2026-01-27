@@ -983,6 +983,24 @@ emacs_skia_canvas_draw_image (emacs_skia_canvas_t *canvas,
 			     paint ? &paint->paint : nullptr);
 }
 
+/* Draw image with explicit sampling control.
+   If smooth is true, use linear filtering (good for scaling down).
+   If smooth is false, use nearest neighbor (shows pixels when scaling up).  */
+void
+emacs_skia_canvas_draw_image_with_sampling (emacs_skia_canvas_t *canvas,
+					    emacs_skia_image_t *image,
+					    float x, float y, bool smooth,
+					    emacs_skia_paint_t *paint)
+{
+  if (!canvas || !canvas->canvas || !image || !image->image)
+    return;
+
+  SkSamplingOptions sampling (smooth ? SkFilterMode::kLinear
+				     : SkFilterMode::kNearest);
+  canvas->canvas->drawImage (image->image.get (), x, y, sampling,
+			     paint ? &paint->paint : nullptr);
+}
+
 void
 emacs_skia_canvas_draw_image_rect (emacs_skia_canvas_t *canvas,
 				   emacs_skia_image_t *image,
