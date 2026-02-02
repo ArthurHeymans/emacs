@@ -7935,9 +7935,11 @@ static gboolean pgtk_selection_event (GtkWidget *, GdkEvent *, gpointer);
 #ifdef USE_SKIA
 /* Forward declarations for GtkGLArea callbacks.  */
 static void pgtk_gl_area_realize (GtkGLArea *, gpointer);
+static void pgtk_gl_area_unrealize (GtkGLArea *, gpointer);
 static gboolean pgtk_gl_area_render (GtkGLArea *, GdkGLContext *, gpointer);
 static void pgtk_gl_area_resize (GtkGLArea *, gint, gint, gpointer);
 static bool pgtk_setup_gl_framebuffer (struct frame *, int, int);
+static bool pgtk_check_gl_error (const char *);
 #endif
 
 void
@@ -8018,6 +8020,8 @@ pgtk_set_event_handler (struct frame *f)
     /* Connect GtkGLArea signals.  */
     g_signal_connect (G_OBJECT (gl_area), "realize",
 		      G_CALLBACK (pgtk_gl_area_realize), f);
+    g_signal_connect (G_OBJECT (gl_area), "unrealize",
+		      G_CALLBACK (pgtk_gl_area_unrealize), f);
     g_signal_connect (G_OBJECT (gl_area), "render",
 		      G_CALLBACK (pgtk_gl_area_render), f);
     g_signal_connect (G_OBJECT (gl_area), "resize",
@@ -8634,6 +8638,86 @@ pgtk_clear_area (struct frame *f, int x, int y, int width, int height)
    Skia drawing functions
    ============================================================ */
 
+/* Check for GL errors and clear them.  Returns true if an error occurred.  */
+static bool
+pgtk_check_gl_error (const char *context)
+{
+  GLenum err = glGetError ();
+  if (err != GL_NO_ERROR)
+    {
+      const char *err_str;
+      switch (err)
+	{
+	case GL_INVALID_ENUM: err_str = "GL_INVALID_ENUM"; break;
+	case GL_INVALID_VALUE: err_str = "GL_INVALID_VALUE"; break;
+	case GL_INVALID_OPERATION: err_str = "GL_INVALID_OPERATION"; break;
+	case GL_INVALID_FRAMEBUFFER_OPERATION:
+	  err_str = "GL_INVALID_FRAMEBUFFER_OPERATION"; break;
+	case GL_OUT_OF_MEMORY: err_str = "GL_OUT_OF_MEMORY"; break;
+	default: err_str = "UNKNOWN"; break;
+	}
+      fprintf (stderr, "Skia GL error in %s: %s (0x%x)\n", context, err_str, err);
+      return true;
+    }
+  return false;
+}
+
+/* GtkGLArea "unrealize" callback - clean up GL resources when context is lost.
+   This is critical for handling display sleep, window manager changes, or
+   driver issues that invalidate the GL context.  */
+static void
+pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
+{
+  struct frame *f = (struct frame *) user_data;
+
+  /* The GL context is about to be destroyed.  We must clean up all
+     Skia resources that depend on it before this happens.  */
+
+  /* Destroy Skia surface first (it references the GL context).  */
+  if (FRAME_SKIA_SURFACE (f))
+    {
+      emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+      FRAME_SKIA_SURFACE (f) = NULL;
+      FRAME_SKIA_CANVAS (f) = NULL;
+    }
+
+  /* Destroy the visible bell surface if any.  */
+  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
+    {
+      emacs_skia_surface_destroy (FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
+      FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
+    }
+
+  /* Destroy paint object.  */
+  if (FRAME_SKIA_PAINT (f))
+    {
+      emacs_skia_paint_destroy (FRAME_SKIA_PAINT (f));
+      FRAME_SKIA_PAINT (f) = NULL;
+    }
+
+  /* Destroy the Skia GL context.  */
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    {
+      emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
+      FRAME_SKIA_GL_CONTEXT (f) = NULL;
+    }
+
+  /* GL resources (FBO, texture, stencil) will be automatically destroyed
+     when the GdkGLContext is destroyed by GTK.  Just clear our references.  */
+  FRAME_GL_FRAMEBUFFER (f) = 0;
+  FRAME_GL_TEXTURE (f) = 0;
+  FRAME_GL_STENCIL (f) = 0;
+
+  /* The GdkGLContext is owned by GtkGLArea, don't unref it.  */
+  FRAME_GDK_GL_CONTEXT (f) = NULL;
+
+  FRAME_SKIA_GL_INITIALIZED (f) = false;
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+
+  /* Mark frame as garbaged so it gets redrawn when realized again.  */
+  SET_FRAME_GARBAGED (f);
+}
+
 /* GtkGLArea "realize" callback - set up GL resources.  */
 static void
 pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
@@ -8645,7 +8729,15 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
 
   GError *gl_error = gtk_gl_area_get_error (gl_area);
   if (gl_error != NULL)
-    return;
+    {
+      fprintf (stderr, "Skia: GtkGLArea error on realize: %s\n",
+	       gl_error->message);
+      return;
+    }
+
+  /* Clear any pending GL errors from previous context.  */
+  while (glGetError () != GL_NO_ERROR)
+    ;
 
   /* Get the GDK GL context from GtkGLArea.  */
   GdkGLContext *gl_context = gtk_gl_area_get_context (gl_area);
@@ -8729,12 +8821,25 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
 	{
 	  /* Wait up to 100ms (100,000,000 nanoseconds).  */
 	  const uint64_t timeout_ns = 100000000ULL;
-	  emacs_skia_fence_wait (fence, timeout_ns);
+	  bool completed = emacs_skia_fence_wait (fence, timeout_ns);
 	  emacs_skia_fence_destroy (fence);
+
+	  /* Fence timeout may indicate GL context issues.  Check for errors.  */
+	  if (!completed)
+	    {
+	      fprintf (stderr, "Skia: GL fence wait timed out - "
+		       "possible GL context corruption\n");
+	      /* Check for GL errors that might explain the timeout.  */
+	      pgtk_check_gl_error ("fence_wait_timeout");
+	    }
 	}
       else
 	{
-	  /* Fallback to glFinish if fence creation fails.  */
+	  /* Fence creation failed - this is unusual and may indicate
+	     GL context problems.  Log it and try glFinish as fallback.  */
+	  fprintf (stderr, "Skia: GL fence creation failed - "
+		   "falling back to glFinish\n");
+	  pgtk_check_gl_error ("fence_create_failed");
 	  glFinish ();
 	}
 
@@ -9048,10 +9153,23 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
   /* Make the GL context current.  */
   gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
+  /* Clear any stale GL errors before starting.  */
+  while (glGetError () != GL_NO_ERROR)
+    ;
+
   /* Bind and configure the texture.  */
   glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
   glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
 		GL_UNSIGNED_BYTE, NULL);
+
+  /* Check for GL errors after texture allocation - this is where
+     out-of-memory errors would typically appear.  */
+  if (pgtk_check_gl_error ("glTexImage2D"))
+    {
+      glBindTexture (GL_TEXTURE_2D, 0);
+      return false;
+    }
+
   glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
@@ -9062,6 +9180,13 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
   glBindRenderbuffer (GL_RENDERBUFFER, FRAME_GL_STENCIL (f));
   glRenderbufferStorage (GL_RENDERBUFFER, GL_STENCIL_INDEX8, width, height);
 
+  if (pgtk_check_gl_error ("glRenderbufferStorage"))
+    {
+      glBindRenderbuffer (GL_RENDERBUFFER, 0);
+      glBindTexture (GL_TEXTURE_2D, 0);
+      return false;
+    }
+
   /* Bind the framebuffer and attach the texture and stencil.  */
   glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
   glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -9071,7 +9196,24 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
 
   GLenum status = glCheckFramebufferStatus (GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
-    return false;
+    {
+      const char *status_str;
+      switch (status)
+	{
+	case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
+	  status_str = "INCOMPLETE_ATTACHMENT"; break;
+	case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
+	  status_str = "INCOMPLETE_MISSING_ATTACHMENT"; break;
+	case GL_FRAMEBUFFER_UNSUPPORTED:
+	  status_str = "UNSUPPORTED"; break;
+	default:
+	  status_str = "UNKNOWN"; break;
+	}
+      fprintf (stderr, "Skia: Framebuffer incomplete: %s (0x%x), size=%dx%d\n",
+	       status_str, status, width, height);
+      glBindFramebuffer (GL_FRAMEBUFFER, 0);
+      return false;
+    }
 
   /* Clear the FBO to black initially to avoid garbage data.
      The actual background color will be set when Skia draws.  */
@@ -9171,11 +9313,36 @@ pgtk_begin_skia_clip (struct frame *f)
 	  /* Make the GtkGLArea's context current.  */
 	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
 
+	  /* Check if the GL context is valid after make_current.  */
+	  GError *gl_error = gtk_gl_area_get_error (
+	    GTK_GL_AREA (FRAME_GL_AREA (f)));
+	  if (gl_error != NULL)
+	    {
+	      /* GL context is invalid - cannot draw.  This happens when
+		 the context is lost (e.g., display sleep, driver issues).
+		 The unrealize callback should clean up and realize will
+		 recreate the context.  */
+	      fprintf (stderr, "Skia: GL context error in begin_skia_clip: %s\n",
+		       gl_error->message);
+	      return NULL;
+	    }
+
+	  /* Clear any stale GL errors.  */
+	  while (glGetError () != GL_NO_ERROR)
+	    ;
+
 	  /* Set up FBO if not already done, or resize if size changed.
 	     This handles cases where size_allocate fires before the
 	     GtkGLArea resize signal (e.g., tiling WM fullscreen).  */
 	  if (!FRAME_GL_FRAMEBUFFER (f))
-	    pgtk_setup_gl_framebuffer (f, width, height);
+	    {
+	      if (!pgtk_setup_gl_framebuffer (f, width, height))
+		{
+		  fprintf (stderr, "Skia: Failed to set up GL framebuffer\n");
+		  pgtk_check_gl_error ("setup_gl_framebuffer");
+		  return NULL;
+		}
+	    }
 	  else
 	    {
 	      /* Check if FBO needs resizing by querying the texture size.  */
@@ -9200,6 +9367,13 @@ pgtk_begin_skia_clip (struct frame *f)
 						width, height,
 						FRAME_GL_FRAMEBUFFER (f),
 						GL_RGBA8);
+	      if (!FRAME_SKIA_SURFACE (f))
+		{
+		  fprintf (stderr, "Skia: Failed to create GL surface "
+			   "(size=%dx%d, fbo=%u)\n",
+			   width, height, FRAME_GL_FRAMEBUFFER (f));
+		  pgtk_check_gl_error ("surface_create_gl");
+		}
 	    }
 	}
       /* Fallback: create offscreen GL context if no GtkGLArea.  */
@@ -9208,15 +9382,32 @@ pgtk_begin_skia_clip (struct frame *f)
 	{
 	  /* Make GL context current.  */
 	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+	  /* Clear any stale GL errors.  */
+	  while (glGetError () != GL_NO_ERROR)
+	    ;
+
 	  FRAME_SKIA_SURFACE (f)
 	    = emacs_skia_surface_create_gl (FRAME_SKIA_GL_CONTEXT (f),
 					    width, height,
 					    FRAME_GL_FRAMEBUFFER (f),
 					    GL_RGBA8);
+	  if (!FRAME_SKIA_SURFACE (f))
+	    {
+	      fprintf (stderr, "Skia: Failed to create GL surface "
+		       "(fallback path, size=%dx%d)\n", width, height);
+	      pgtk_check_gl_error ("surface_create_gl_fallback");
+	    }
 	}
 
       if (!FRAME_SKIA_SURFACE (f))
-	return NULL;
+	{
+	  /* Surface creation failed.  This could be due to GL context
+	     issues.  Log the failure for debugging.  */
+	  fprintf (stderr, "Skia: No surface available for frame %p\n",
+		   (void *) f);
+	  return NULL;
+	}
 
       canvas = emacs_skia_surface_get_canvas (FRAME_SKIA_SURFACE (f));
       FRAME_SKIA_CANVAS (f) = canvas;
@@ -9257,7 +9448,27 @@ pgtk_begin_skia_clip (struct frame *f)
       /* For GL surfaces, ensure the GL context is current before any
 	 drawing operations.  Skia's GL backend requires this.  */
       if (FRAME_GL_AREA (f))
-	gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
+	{
+	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
+
+	  /* Check if the GL context is still valid.  */
+	  GError *gl_error = gtk_gl_area_get_error (
+	    GTK_GL_AREA (FRAME_GL_AREA (f)));
+	  if (gl_error != NULL)
+	    {
+	      /* GL context is invalid - need to recreate.  Clear the
+		 cached canvas/surface so the next call recreates them.  */
+	      fprintf (stderr, "Skia: GL context lost in begin_skia_clip "
+		       "(existing canvas): %s\n", gl_error->message);
+	      FRAME_SKIA_CANVAS (f) = NULL;
+	      if (FRAME_SKIA_SURFACE (f))
+		{
+		  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+		  FRAME_SKIA_SURFACE (f) = NULL;
+		}
+	      return NULL;
+	    }
+	}
       else
 	gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
