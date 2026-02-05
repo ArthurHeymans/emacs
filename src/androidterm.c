@@ -908,10 +908,25 @@ handle_one_android_event (struct android_display_info *dpyinfo,
 	      && ((f->new_width >= 0 && width != f->new_width)
 		  || (f->new_height >= 0 && height != f->new_height))))
 	{
+	  int old_width = FRAME_PIXEL_WIDTH (f);
+	  int old_height = FRAME_PIXEL_HEIGHT (f);
+
 	  change_frame_size (f, width, height, false, true, false);
 	  android_clear_under_internal_border (f);
 	  SET_FRAME_GARBAGED (f);
 	  cancel_mouse_face (f);
+
+	  /* Generate resize-frame event if the frame size actually
+	     changed.  */
+	  if (!FRAME_TOOLTIP_P (f)
+	      && (width != old_width || height != old_height))
+	    {
+	      struct input_event resize_event;
+	      EVENT_INIT (resize_event);
+	      resize_event.kind = RESIZE_FRAME_EVENT;
+	      XSETFRAME (resize_event.frame_or_window, f);
+	      kbd_buffer_store_event (&resize_event);
+	    }
 	}
 
       /* Now change the left and top position of this window.  */

@@ -386,7 +386,17 @@ This function runs the abnormal hook `move-frame-functions'."
   (let ((frame (posn-window (event-start event))))
     (when (frame-live-p frame) ;Experience shows it can die in the meantime.
       (run-hook-with-args 'move-frame-functions frame))))
-
+
+(defun handle-resize-frame (event)
+  "Handle a resize-frame event.
+This function runs the abnormal hook `resize-frame-functions'.
+Unlike `window-size-change-functions', this hook runs immediately when
+the frame resize event is received, not during redisplay."
+  (interactive "e")
+  (let ((frame (posn-window (event-start event))))
+    (when (frame-live-p frame)
+      (run-hook-with-args 'resize-frame-functions frame))))
+
 ;;;; Arrangement of frames at startup
 
 ;; 1) Load the window system startup file from the lisp library and read the

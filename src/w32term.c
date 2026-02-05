@@ -5931,6 +5931,9 @@ w32_read_socket (struct terminal *terminal,
 		  if (width != FRAME_PIXEL_WIDTH (f)
 		      || height != FRAME_PIXEL_HEIGHT (f))
 		    {
+		      int old_width = FRAME_PIXEL_WIDTH (f);
+		      int old_height = FRAME_PIXEL_HEIGHT (f);
+
 		      w32_release_paint_buffer (f);
 
 		      change_frame_size
@@ -5938,6 +5941,18 @@ w32_read_socket (struct terminal *terminal,
 		      SET_FRAME_GARBAGED (f);
 		      cancel_mouse_face (f);
 		      f->win_gravity = NorthWestGravity;
+
+		      /* Generate resize-frame event if the frame size
+			 actually changed.  */
+		      if (!FRAME_TOOLTIP_P (f)
+			  && (width != old_width || height != old_height))
+			{
+			  struct input_event resize_event;
+			  EVENT_INIT (resize_event);
+			  resize_event.kind = RESIZE_FRAME_EVENT;
+			  XSETFRAME (resize_event.frame_or_window, f);
+			  kbd_buffer_store_event (&resize_event);
+			}
 		    }
 		}
 	    }

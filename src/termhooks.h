@@ -238,6 +238,9 @@ enum event_kind
   /* Generated when a frame is moved.  */
   MOVE_FRAME_EVENT,
 
+  /* Generated when a frame is resized.  */
+  RESIZE_FRAME_EVENT,
+
   /* Generated when mouse moves over window not currently selected.  */
   SELECT_WINDOW_EVENT,
 

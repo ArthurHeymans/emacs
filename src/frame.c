@@ -7468,6 +7468,13 @@ clickable text.  See `mouse-highlight'.  */);
 The functions are run with one arg, the frame that moved.  */);
   Vmove_frame_functions = Qnil;
 
+  DEFVAR_LISP ("resize-frame-functions", Vresize_frame_functions,
+               doc: /* Functions run after a frame was resized.
+The functions are run with one arg, the frame that was resized.
+This hook runs immediately when the frame resize event is received,
+unlike `window-size-change-functions' which runs during redisplay.  */);
+  Vresize_frame_functions = Qnil;
+
   DEFVAR_LISP ("delete-frame-functions", Vdelete_frame_functions,
 	       doc: /* Functions run before deleting a frame.
 The functions are run with one arg, the frame to be deleted.

@@ -4281,6 +4281,7 @@ kbd_buffer_get_event (KBOARD **kbp,
       case ICONIFY_EVENT:
       case DEICONIFY_EVENT:
       case MOVE_FRAME_EVENT:
+      case RESIZE_FRAME_EVENT:
 #endif
 #ifdef USE_FILE_NOTIFY
       case FILE_NOTIFY_EVENT:
@@ -6213,6 +6214,10 @@ make_lispy_event (struct input_event *event)
     case MOVE_FRAME_EVENT:
       /* Make an event (move-frame (FRAME)).  */
       return list2 (Qmove_frame, list1 (event->frame_or_window));
+
+    case RESIZE_FRAME_EVENT:
+      /* Make an event (resize-frame (FRAME)).  */
+      return list2 (Qresize_frame, list1 (event->frame_or_window));
 #endif
 
     /* Just discard these, by returning nil.
@@ -12103,6 +12108,7 @@ Only 'input_event' slots KIND and ARG are set.  */)
      : EQ (XCAR (event), Qfocus_in) ? FOCUS_IN_EVENT
      : EQ (XCAR (event), Qfocus_out) ? FOCUS_OUT_EVENT
      : EQ (XCAR (event), Qmove_frame) ? MOVE_FRAME_EVENT
+     : EQ (XCAR (event), Qresize_frame) ? RESIZE_FRAME_EVENT
      : EQ (XCAR (event), Qsleep_event) ? SLEEP_EVENT
      : NO_EVENT);
   ie.frame_or_window = Qnil;
@@ -13269,6 +13275,7 @@ static const struct event_head head_table[] = {
   {SYMBOL_INDEX (Qfocus_in),            SYMBOL_INDEX (Qfocus_in)},
   {SYMBOL_INDEX (Qfocus_out),           SYMBOL_INDEX (Qfocus_out)},
   {SYMBOL_INDEX (Qmove_frame),          SYMBOL_INDEX (Qmove_frame)},
+  {SYMBOL_INDEX (Qresize_frame),        SYMBOL_INDEX (Qresize_frame)},
   {SYMBOL_INDEX (Qdelete_frame),        SYMBOL_INDEX (Qdelete_frame)},
   {SYMBOL_INDEX (Qiconify_frame),       SYMBOL_INDEX (Qiconify_frame)},
   {SYMBOL_INDEX (Qmake_frame_visible),  SYMBOL_INDEX (Qmake_frame_visible)},
@@ -13284,10 +13291,10 @@ static Lisp_Object
 init_while_no_input_ignore_events (void)
 {
   Lisp_Object events = list (Qselect_window, Qhelp_echo, Qmove_frame,
-			     Qiconify_frame, Qmake_frame_visible,
-			     Qfocus_in, Qfocus_out, Qconfig_changed_event,
-			     Qselection_request, Qmonitors_changed,
-			     Qtoolkit_theme_changed);
+			     Qresize_frame, Qiconify_frame,
+			     Qmake_frame_visible, Qfocus_in, Qfocus_out,
+			     Qconfig_changed_event, Qselection_request,
+			     Qmonitors_changed, Qtoolkit_theme_changed);
 
 #ifdef HAVE_DBUS
   events = Fcons (Qdbus_event, events);
@@ -13560,6 +13567,7 @@ syms_of_keyboard (void)
   DEFSYM (Qfocus_in, "focus-in");
   DEFSYM (Qfocus_out, "focus-out");
   DEFSYM (Qmove_frame, "move-frame");
+  DEFSYM (Qresize_frame, "resize-frame");
   DEFSYM (Qdelete_frame, "delete-frame");
   DEFSYM (Qiconify_frame, "iconify-frame");
   DEFSYM (Qmake_frame_visible, "make-frame-visible");
@@ -14553,6 +14561,8 @@ keys_of_keyboard (void)
 			    "handle-focus-out");
   initial_define_lispy_key (Vspecial_event_map, "move-frame",
 			    "handle-move-frame");
+  initial_define_lispy_key (Vspecial_event_map, "resize-frame",
+			    "handle-resize-frame");
   initial_define_lispy_key (Vspecial_event_map, "sleep-event",
 			    "ignore");
 }

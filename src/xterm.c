@@ -21613,6 +21613,8 @@ handle_one_xevent (struct x_display_info *dpyinfo,
 #ifndef USE_GTK
           int width = configureEvent.xconfigure.width;
           int height = configureEvent.xconfigure.height;
+	  int old_width = FRAME_PIXEL_WIDTH (f);
+	  int old_height = FRAME_PIXEL_HEIGHT (f);
 
 	  if (CONSP (frame_size_history))
 	    frame_size_history_extra
@@ -21639,6 +21641,17 @@ handle_one_xevent (struct x_display_info *dpyinfo,
               SET_FRAME_GARBAGED (f);
               cancel_mouse_face (f);
             }
+
+	  /* Generate resize-frame event if the frame size actually changed.  */
+	  if (!FRAME_TOOLTIP_P (f)
+	      && (width != old_width || height != old_height))
+	    {
+	      struct input_event resize_event;
+	      EVENT_INIT (resize_event);
+	      resize_event.kind = RESIZE_FRAME_EVENT;
+	      XSETFRAME (resize_event.frame_or_window, f);
+	      kbd_buffer_store_event (&resize_event);
+	    }
 #endif /* not USE_GTK */
 #endif
 
