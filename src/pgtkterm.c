@@ -6188,7 +6188,16 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
       /* Resize the GtkGLArea to fill the frame.  GtkFixed doesn't
 	 automatically re-allocate children when their size request
 	 changes, so we must explicitly allocate the GtkGLArea.  This
-	 triggers its "resize" signal, which updates the Skia surface.  */
+	 triggers its "resize" signal, which handles all GL resource
+	 updates (FBO resize, surface destruction, etc.).
+
+	 IMPORTANT: Do NOT call pgtk_skia_update_surface_desired_size
+	 here.  That would destroy the Skia surface with glFinish()
+	 before the GtkGLArea resize callback runs, creating a race
+	 condition: the resize callback would find the surface already
+	 NULL and the GL context may be in an inconsistent state.
+	 Instead, just update the desired dimensions and let
+	 pgtk_gl_area_resize handle the actual GL work.  */
       if (FRAME_GL_AREA (f))
 	{
 	  GtkAllocation gl_alloc;
@@ -6196,10 +6205,16 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
 	  gl_alloc.y = 0;
 	  gl_alloc.width = alloc->width;
 	  gl_alloc.height = alloc->height;
+	  /* Record the desired size so pgtk_begin_skia_clip knows the
+	     target dimensions.  Do NOT destroy the surface here.  */
+	  FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = alloc->width;
+	  FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = alloc->height;
 	  gtk_widget_size_allocate (FRAME_GL_AREA (f), &gl_alloc);
 	}
-      pgtk_skia_update_surface_desired_size (f, alloc->width,
-					     alloc->height, false);
+      else
+	/* Fallback path without GtkGLArea.  */
+	pgtk_skia_update_surface_desired_size (f, alloc->width,
+					       alloc->height, false);
 #else
       pgtk_cr_update_surface_desired_size (f, alloc->width,
 					   alloc->height, false);
@@ -8662,6 +8677,50 @@ pgtk_check_gl_error (const char *context)
   return false;
 }
 
+/* Wait for GPU operations to complete using a non-blocking fence with
+   timeout.  This replaces glFinish() which can block indefinitely and
+   freeze Emacs when the GPU is in a bad state.  Returns true if the
+   GPU completed in time, false on timeout.  */
+static bool
+pgtk_gl_finish_with_timeout (const char *context)
+{
+  /* Flush any buffered GL commands before creating the fence.
+     Without this, some drivers may not have submitted commands to
+     the GPU yet, and the fence could signal immediately without
+     actually waiting for the intended work to complete.  */
+  glFlush ();
+
+  emacs_skia_fence_t *fence = emacs_skia_fence_create ();
+  if (fence)
+    {
+      /* 200ms timeout — generous enough for legitimate GPU work,
+	 short enough to avoid perceptible hangs.  */
+      const uint64_t timeout_ns = 200000000ULL;
+      bool completed = emacs_skia_fence_wait (fence, timeout_ns);
+      emacs_skia_fence_destroy (fence);
+
+      if (!completed)
+	{
+	  fprintf (stderr, "Skia: GL sync timed out in %s - "
+		   "possible GPU stall\n", context);
+	  pgtk_check_gl_error (context);
+	}
+      return completed;
+    }
+  else
+    {
+      /* Fence creation failed — GL context may be broken.  Don't
+	 fall back to glFinish() as that can block forever and freeze
+	 Emacs.  Callers that destroy GPU resources after this may
+	 trigger GPU-side use-after-free, but GPU drivers handle this
+	 gracefully (deferred deletion).  The alternative — an
+	 indefinite hang — is far worse.  */
+      fprintf (stderr, "Skia: fence creation failed in %s\n", context);
+      pgtk_check_gl_error (context);
+      return false;
+    }
+}
+
 /* GtkGLArea "unrealize" callback - clean up GL resources when context is lost.
    This is critical for handling display sleep, window manager changes, or
    driver issues that invalidate the GL context.  */
@@ -8713,6 +8772,7 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
 
   FRAME_SKIA_GL_INITIALIZED (f) = false;
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  FRAME_GL_TIMEOUT_COUNT (f) = 0;
 
   /* Mark frame as garbaged so it gets redrawn when realized again.  */
   SET_FRAME_GARBAGED (f);
@@ -8761,6 +8821,7 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
 
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  FRAME_GL_TIMEOUT_COUNT (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
 
@@ -8814,34 +8875,56 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
 
       /* Use non-blocking fence sync with timeout instead of glFinish()
 	 to prevent indefinite blocking that can freeze keyboard input.
-	 100ms timeout is enough for most GPU operations while preventing
+	 200ms timeout is enough for most GPU operations while preventing
 	 hangs from corrupted GL state.  */
-      emacs_skia_fence_t *fence = emacs_skia_fence_create ();
-      if (fence)
-	{
-	  /* Wait up to 100ms (100,000,000 nanoseconds).  */
-	  const uint64_t timeout_ns = 100000000ULL;
-	  bool completed = emacs_skia_fence_wait (fence, timeout_ns);
-	  emacs_skia_fence_destroy (fence);
+      bool gpu_ready = pgtk_gl_finish_with_timeout ("render_flush");
 
-	  /* Fence timeout may indicate GL context issues.  Check for errors.  */
-	  if (!completed)
-	    {
-	      fprintf (stderr, "Skia: GL fence wait timed out - "
-		       "possible GL context corruption\n");
-	      /* Check for GL errors that might explain the timeout.  */
-	      pgtk_check_gl_error ("fence_wait_timeout");
-	    }
-	}
-      else
+      if (!gpu_ready)
 	{
-	  /* Fence creation failed - this is unusual and may indicate
-	     GL context problems.  Log it and try glFinish as fallback.  */
-	  fprintf (stderr, "Skia: GL fence creation failed - "
-		   "falling back to glFinish\n");
-	  pgtk_check_gl_error ("fence_create_failed");
-	  glFinish ();
+	  FRAME_GL_TIMEOUT_COUNT (f)++;
+
+	  /* GPU didn't finish in time.  Do NOT blit potentially
+	     incomplete/corrupt FBO content — that leads to a
+	     transparent frame.  Instead, clear to background and
+	     request a full redraw.  This lets Emacs recover from
+	     transient GPU stalls without getting stuck.  */
+	  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+	  float r = RED_FROM_ULONG (bg) / 255.0f;
+	  float g = GREEN_FROM_ULONG (bg) / 255.0f;
+	  float b = BLUE_FROM_ULONG (bg) / 255.0f;
+	  float a = (float) f->alpha_background;
+	  glClearColor (r, g, b, a);
+	  glClear (GL_COLOR_BUFFER_BIT);
+
+	  if (FRAME_GL_TIMEOUT_COUNT (f) >= 3)
+	    {
+	      /* Multiple consecutive timeouts indicate persistent GL
+		 context corruption.  Destroy the Skia surface to force
+		 a complete rebuild on the next draw.  The GL context
+		 and FBO are preserved — only the Skia wrapper is
+		 rebuilt, which forces Skia to re-query all GL state.  */
+	      fprintf (stderr, "Skia: %d consecutive GPU timeouts - "
+		       "forcing Skia surface rebuild\n",
+		       FRAME_GL_TIMEOUT_COUNT (f));
+	      if (FRAME_SKIA_SURFACE (f))
+		{
+		  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+		  FRAME_SKIA_SURFACE (f) = NULL;
+		  FRAME_SKIA_CANVAS (f) = NULL;
+		}
+	      if (FRAME_SKIA_GL_CONTEXT (f))
+		emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+	      FRAME_GL_TIMEOUT_COUNT (f) = 0;
+	    }
+
+	  /* Force a complete redraw so content is regenerated.  */
+	  SET_FRAME_GARBAGED (f);
+	  gtk_gl_area_queue_render (gl_area);
+	  return TRUE;
 	}
+
+      /* GPU completed successfully — reset timeout counter.  */
+      FRAME_GL_TIMEOUT_COUNT (f) = 0;
 
       /* Re-attach GtkGLArea's buffers after Skia flush.  Skia's flush
 	 operation binds our FBO internally, so we need to restore
@@ -8850,47 +8933,29 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
     }
   else
     {
-      /* Surface is NULL - this can happen during initial setup or resize.
-	 If we haven't drawn anything yet (FRAME_SKIA_GL_STATE_DIRTY is
-	 still true from setup), clear to background instead of blitting
-	 potentially garbage FBO content.  */
-      if (FRAME_SKIA_GL_STATE_DIRTY (f))
-	{
-	  /* Haven't drawn yet - clear to background color.  */
-	  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-	  float r = RED_FROM_ULONG (bg) / 255.0f;
-	  float g = GREEN_FROM_ULONG (bg) / 255.0f;
-	  float b = BLUE_FROM_ULONG (bg) / 255.0f;
-	  float a = (float) f->alpha_background;
-	  glClearColor (r, g, b, a);
-	  glClear (GL_COLOR_BUFFER_BIT);
-	  gtk_gl_area_queue_render (gl_area);
-	  return TRUE;
-	}
-      /* Otherwise, FBO has valid preserved content from resize.
-	 Queue another render and fall through to blit.  */
+      /* Surface is NULL — this happens during resize (surface destroyed,
+	 waiting for pgtk_begin_skia_clip to recreate it).  Clear to
+	 background and request a full redraw.  Do NOT fall through to
+	 the blit code — the FBO content may be stale, partially
+	 updated, or from a different size.  Blitting it would show
+	 garbage or a transparent frame.  */
+      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+      float r = RED_FROM_ULONG (bg) / 255.0f;
+      float g = GREEN_FROM_ULONG (bg) / 255.0f;
+      float b = BLUE_FROM_ULONG (bg) / 255.0f;
+      float a = (float) f->alpha_background;
+      glClearColor (r, g, b, a);
+      glClear (GL_COLOR_BUFFER_BIT);
+      SET_FRAME_GARBAGED (f);
       gtk_gl_area_queue_render (gl_area);
+      return TRUE;
     }
 
-  /* Get source dimensions from Skia surface if available, otherwise
-     from the FBO texture (for resize case where surface is destroyed
-     but FBO has preserved content).  */
-  int src_width, src_height;
-  if (skia_surface)
-    {
-      src_width = emacs_skia_surface_get_width (skia_surface);
-      src_height = emacs_skia_surface_get_height (skia_surface);
-    }
-  else
-    {
-      /* Query FBO texture size directly.  */
-      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
-      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-				&src_width);
-      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-				&src_height);
-      glBindTexture (GL_TEXTURE_2D, 0);
-    }
+  /* Get source dimensions from the Skia surface.  At this point
+     skia_surface is always non-NULL — the NULL case returns early
+     above.  */
+  int src_width = emacs_skia_surface_get_width (skia_surface);
+  int src_height = emacs_skia_surface_get_height (skia_surface);
 
   /* Get the destination size from the GtkGLArea's allocation, scaled
      for HiDPI.  We cannot use glGetIntegerv(GL_VIEWPORT) because for
@@ -8977,15 +9042,9 @@ pgtk_resize_fbo_preserve_content (struct frame *f, int old_width,
 		     0, 0, blit_width, blit_height,
 		     GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-  /* Use non-blocking fence sync with timeout instead of glFinish().  */
-  emacs_skia_fence_t *fence = emacs_skia_fence_create ();
-  if (fence)
-    {
-      emacs_skia_fence_wait (fence, 100000000ULL);  /* 100ms timeout */
-      emacs_skia_fence_destroy (fence);
-    }
-  else
-    glFinish ();  /* Fallback if fence creation fails.  */
+  /* Wait for GPU to finish the blit operations.  Use non-blocking
+     fence with timeout to prevent indefinite hangs.  */
+  pgtk_gl_finish_with_timeout ("resize_fbo_preserve_content");
 
   /* Clean up temp resources.  */
   glDeleteFramebuffers (1, &temp_fbo);
@@ -9028,15 +9087,7 @@ pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
 	  if (FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      /* Use fence sync with timeout instead of blocking glFinish.  */
-	      emacs_skia_fence_t *fence = emacs_skia_fence_create ();
-	      if (fence)
-		{
-		  emacs_skia_fence_wait (fence, 100000000ULL);  /* 100ms */
-		  emacs_skia_fence_destroy (fence);
-		}
-	      else
-		glFinish ();
+	      pgtk_gl_finish_with_timeout ("gl_area_resize_flush");
 	    }
 	  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
 	  FRAME_SKIA_SURFACE (f) = NULL;
@@ -9125,6 +9176,7 @@ pgtk_init_gl_area (struct frame *f)
 
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  FRAME_GL_TIMEOUT_COUNT (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
   /* No GtkGLArea - we use direct GdkGLContext.  */
@@ -9219,7 +9271,7 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
      The actual background color will be set when Skia draws.  */
   glClearColor (0.0f, 0.0f, 0.0f, 1.0f);
   glClear (GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-  glFinish ();
+  pgtk_gl_finish_with_timeout ("setup_gl_framebuffer");
 
   /* Unbind the framebuffer.  */
   glBindFramebuffer (GL_FRAMEBUFFER, 0);
@@ -9436,7 +9488,7 @@ pgtk_begin_skia_clip (struct frame *f)
 	if (FRAME_SKIA_GL_CONTEXT (f))
 	  {
 	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	    glFinish ();
+	    pgtk_gl_finish_with_timeout ("begin_skia_clip_init");
 	    /* Reset Skia state after initial setup.  */
 	    emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
 	    FRAME_SKIA_GL_STATE_DIRTY (f) = false;
@@ -9551,14 +9603,26 @@ pgtk_skia_destroy_surface_only (struct frame *f)
     {
       /* For GL surfaces, make context current and flush before
 	 destroying to ensure any pending operations complete and
-	 the GrDirectContext state is clean.  */
-      if (FRAME_GDK_GL_CONTEXT (f))
+	 the GrDirectContext state is clean.  Use gtk_gl_area_make_current
+	 when GtkGLArea is present to maintain GTK's internal state
+	 tracking; fall back to gdk_gl_context_make_current only for
+	 the direct GdkGLContext path.  */
+      if (FRAME_GL_AREA (f))
+	{
+	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    {
+	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	      pgtk_gl_finish_with_timeout ("destroy_surface_only");
+	    }
+	}
+      else if (FRAME_GDK_GL_CONTEXT (f))
 	{
 	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 	  if (FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      glFinish ();
+	      pgtk_gl_finish_with_timeout ("destroy_surface_only_fallback");
 	    }
 	}
       emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));

@@ -447,6 +447,10 @@ struct pgtk_output
   gint64 last_render_time;
   /* Track when GL state needs reset - avoids unnecessary resetContext calls.  */
   bool skia_gl_state_dirty;
+  /* Count consecutive GPU fence timeouts.  Used to detect persistent
+     GL context corruption and trigger recovery (full GL teardown and
+     rebuild).  Reset to 0 on each successful render.  */
+  int gl_timeout_count;
 #endif
   struct atimer *atimer_visible_bell;
 
@@ -578,6 +582,7 @@ enum
 # define FRAME_GL_STENCIL(f) ((f)->output_data.pgtk->gl_stencil)
 # define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
 # define FRAME_SKIA_GL_STATE_DIRTY(f) ((f)->output_data.pgtk->skia_gl_state_dirty)
+# define FRAME_GL_TIMEOUT_COUNT(f) ((f)->output_data.pgtk->gl_timeout_count)
 #endif
 
 
