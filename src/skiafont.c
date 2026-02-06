@@ -228,10 +228,39 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   skiafont_info->base.bitmap_position_unit = 0;
   skiafont_info->base.ft_face = NULL;
 
-  /* Create Skia typeface and font.  */
+  /* Initialize FT matrix from fontconfig pattern.  */
+  {
+    FcMatrix *fc_matrix;
+    skiafont_info->base.matrix.xx = 0;
+    skiafont_info->base.matrix.yy = 0;
+    skiafont_info->base.matrix.xy = 0;
+    skiafont_info->base.matrix.yx = 0;
+    if (FcPatternGetMatrix (match, FC_MATRIX, 0, &fc_matrix)
+	== FcResultMatch)
+      {
+	skiafont_info->base.matrix.xx = 0x10000L * fc_matrix->xx;
+	skiafont_info->base.matrix.yy = 0x10000L * fc_matrix->yy;
+	skiafont_info->base.matrix.xy = 0x10000L * fc_matrix->xy;
+	skiafont_info->base.matrix.yx = 0x10000L * fc_matrix->yx;
+      }
+  }
+
+# ifdef HAVE_LIBOTF
+  skiafont_info->base.maybe_otf = false;
+  skiafont_info->base.otf = NULL;
+# endif
+# ifdef HAVE_HARFBUZZ
+  skiafont_info->base.hb_font = NULL;
+# endif
+
+  /* Set FONT_FILE_INDEX for font introspection.  */
+  ASET (font_object, FONT_FILE_INDEX, filename);
+
+  /* Create Skia typeface and font, using fontconfig pattern to
+     correctly handle font index for TTC (TrueType Collection) files.  */
   filename_str = SSDATA (filename);
   skiafont_info->skia_typeface
-    = emacs_skia_typeface_create_from_file (filename_str);
+    = emacs_skia_typeface_create_from_fc_pattern (match);
   if (skiafont_info->skia_typeface)
     {
       skiafont_info->skia_font
@@ -254,15 +283,29 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
       emacs_skia_font_get_extents (skiafont_info->skia_font,
 				   &extents);
       font->ascent = lround (extents.ascent);
-      font->descent = lround (extents.descent);
-      font->height = lround (extents.height);
+
+      /* Handle :minspace property like ftcrfont_open does.  */
+      {
+	Lisp_Object val = assq_no_quit (QCminspace,
+					AREF (entity, FONT_EXTRA_INDEX));
+	if (!(CONSP (val) && NILP (XCDR (val))))
+	  {
+	    font->descent = lround (extents.descent);
+	    font->height = font->ascent + font->descent;
+	  }
+	else
+	  {
+	    font->height = lround (extents.height);
+	    font->descent = font->height - font->ascent;
+	  }
+      }
 
       /* Calculate average_width properly by measuring printable ASCII
 	 characters, similar to ftfont.c.  Using max_x_advance would give
 	 the maximum character width, which is incorrect for proportional
 	 fonts and causes issues with image scaling.  */
       {
-	int total_width = 0, n = 0, min_w = 0, space_w = 0;
+	int total_width = 0, n = 0, min_w = 0, max_w = 0, space_w = 0;
 
 	for (int c = 32; c < 127; c++)
 	  {
@@ -280,6 +323,8 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 		    n++;
 		    if (min_w == 0 || w < min_w)
 		      min_w = w;
+		    if (w > max_w)
+		      max_w = w;
 		    if (c == 32)
 		      space_w = w;
 		  }
@@ -290,6 +335,7 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 	  {
 	    font->average_width = total_width / n;
 	    font->min_width = min_w;
+	    font->max_width = max_w;
 	    font->space_width = space_w > 0 ? space_w : font->average_width;
 	  }
 	else
@@ -331,6 +377,29 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 	}
       /* Store ft_face for later use (encode_char, etc.).  */
       skiafont_info->base.ft_face = ft_face;
+
+      /* Compute bitmap_position_unit for bitmap fonts (Bug#73752).  */
+      if (ft_face->units_per_EM)
+	skiafont_info->base.bitmap_position_unit = 0;
+      else if (ft_face->size
+	       && ft_face->size->metrics.height > 0)
+	{
+	  emacs_skia_font_extents_t ext;
+	  emacs_skia_font_get_extents (skiafont_info->skia_font, &ext);
+	  skiafont_info->base.bitmap_position_unit
+	    = ext.height / ft_face->size->metrics.height;
+	}
+      else
+	skiafont_info->base.bitmap_position_unit = 0;
+
+# ifdef HAVE_LIBOTF
+      skiafont_info->base.maybe_otf
+	= (ft_face->face_flags & FT_FACE_FLAG_SFNT) != 0;
+# endif
+
+      /* Adjust underline thickness/position like ftcrfont.  */
+      if (font->underline_thickness > 2)
+	font->underline_position -= font->underline_thickness / 2;
     }
   else
     {
@@ -348,6 +417,9 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 static void
 skiafont_close (struct font *font)
 {
+  if (font_data_structures_may_be_ill_formed ())
+    return;
+
   struct skia_font_info *skiafont_info
     = (struct skia_font_info *) font;
   int i;
@@ -440,6 +512,7 @@ skiafont_text_extents (struct font *font, const unsigned int *code,
 {
   int i, width = 0;
 
+  block_input ();
   memset (metrics, 0, sizeof (*metrics));
 
   for (i = 0; i < nglyphs; i++)
@@ -468,6 +541,7 @@ skiafont_text_extents (struct font *font, const unsigned int *code,
     }
 
   metrics->width = width;
+  unblock_input ();
 }
 
 static int
@@ -707,6 +781,19 @@ skiahbfont_end_hb_font (struct font *font, hb_font_t *hb_font)
 
 # endif /* HAVE_HARFBUZZ */
 
+# ifdef HAVE_PGTK
+static bool
+skiafont_cached_font_ok (struct frame *f, Lisp_Object font_object,
+			 Lisp_Object entity)
+{
+  /* Skia manages its own font rendering settings independently of
+     the system font options.  For now, always accept cached fonts.
+     If Skia font rendering settings need to track gsettings changes,
+     this callback should query xsettings and compare.  */
+  return true;
+}
+# endif
+
 static void syms_of_skiafont_for_pdumper (void);
 
 struct font_driver const skiafont_driver = {
@@ -735,6 +822,9 @@ struct font_driver const skiafont_driver = {
 # endif
   .filter_properties = ftfont_filter_properties,
   .combining_capability = ftfont_combining_capability,
+# ifdef HAVE_PGTK
+  .cached_font_ok = skiafont_cached_font_ok,
+# endif
 };
 
 # ifdef HAVE_HARFBUZZ

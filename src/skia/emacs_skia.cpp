@@ -105,7 +105,7 @@ struct emacs_skia_surface
   sk_sp<SkSurface> surface;
   void *pixels; /* For raster surfaces with external pixels */
 #ifdef SK_GL
-  GrDirectContext *context; /* For GPU surfaces, to flush */
+  sk_sp<GrDirectContext> context; /* Shared ownership for GPU surfaces */
 #endif
   /* Per-surface canvas wrapper to avoid thread-safety issues with
      static variables.  The wrapper holds a borrowed pointer to the
@@ -441,7 +441,7 @@ emacs_skia_gl_context_destroy (emacs_skia_gl_context_t *ctx)
 {
   if (ctx)
     {
-      ctx->context->abandonContext ();
+      ctx->context->releaseResourcesAndAbandonContext ();
       delete ctx;
     }
 }
@@ -635,7 +635,7 @@ emacs_skia_surface_create_gl (emacs_skia_gl_context_t *ctx, int width,
   auto result = new emacs_skia_surface_t;
   result->surface = surface;
   result->pixels = nullptr;
-  result->context = ctx->context.get ();
+  result->context = ctx->context;  /* Share ownership to prevent dangling pointer.  */
   return result;
 }
 #else
@@ -720,7 +720,7 @@ emacs_skia_surface_flush (emacs_skia_surface_t *surface)
 	 GrDirectContext::flushAndSubmit() instead.  */
 #ifdef SK_GL
       if (surface->context)
-	surface->context->flushAndSubmit ();
+	surface->context.get ()->flushAndSubmit ();
 #endif
     }
 }
@@ -1069,31 +1069,29 @@ emacs_skia_canvas_draw_image_with_mask (emacs_skia_canvas_t *canvas,
     }
 
   /* Use a layer with mask as alpha:
-     1. Save the canvas state and create a layer
-     2. Draw the mask as the alpha channel
+     1. Create a layer to composite mask + image
+     2. Draw the mask (provides the alpha channel for the layer)
      3. Draw the image with SrcIn blend mode (uses mask alpha)
-     4. Restore the layer */
-  canvas->canvas->save ();
-
+     4. Restore the layer (composites with underlying canvas) */
   SkRect bounds = SkRect::MakeXYWH (x, y, image->image->width (),
 				    image->image->height ());
   canvas->canvas->saveLayer (bounds, nullptr);
 
-  /* Draw mask as grayscale (will become alpha) */
+  /* Draw mask — its pixel values become the layer's initial alpha.  */
   SkSamplingOptions sampling (SkFilterMode::kNearest);
   canvas->canvas->drawImage (mask->image.get (), x, y, sampling,
 			     nullptr);
 
-  /* Draw image with SrcIn to use mask as alpha */
+  /* Draw image with SrcIn: uses the layer alpha (from mask).
+     Copy all paint properties, not just color.  */
   SkPaint srcInPaint;
-  srcInPaint.setBlendMode (SkBlendMode::kSrcIn);
   if (paint)
-    srcInPaint.setColor (paint->paint.getColor ());
+    srcInPaint = paint->paint;
+  srcInPaint.setBlendMode (SkBlendMode::kSrcIn);
   canvas->canvas->drawImage (image->image.get (), x, y, sampling,
 			     &srcInPaint);
 
-  canvas->canvas->restore (); /* Restore layer */
-  canvas->canvas->restore (); /* Restore original state */
+  canvas->canvas->restore (); /* Restore and composite layer */
 }
 
 void
@@ -1122,7 +1120,8 @@ emacs_skia_paint_create (void)
 void
 emacs_skia_paint_destroy (emacs_skia_paint_t *paint)
 {
-  delete paint;
+  if (paint)
+    delete paint;
 }
 
 void
@@ -1195,10 +1194,10 @@ emacs_skia_paint_set_dash (emacs_skia_paint_t *paint,
 			   const float *intervals, int count,
 			   float phase)
 {
-  if (!paint || !intervals || count < 2)
+  if (!paint || !intervals || count < 2 || (count % 2) != 0)
     return;
 
-  /* Skia requires SkScalar array, which is float.
+  /* Skia requires SkScalar array with even count.
      Newer Skia versions use SkSpan instead of pointer+count.  */
   auto effect
     = SkDashPathEffect::Make (SkSpan<const float> (intervals, count),
@@ -1313,7 +1312,8 @@ emacs_skia_typeface_create_from_name (const char *family_name,
 void
 emacs_skia_typeface_destroy (emacs_skia_typeface_t *typeface)
 {
-  delete typeface;
+  if (typeface)
+    delete typeface;
 }
 
 #ifdef HAVE_FONTCONFIG
@@ -1403,7 +1403,8 @@ emacs_skia_font_create (emacs_skia_typeface_t *typeface, float size)
 void
 emacs_skia_font_destroy (emacs_skia_font_t *font)
 {
-  delete font;
+  if (font)
+    delete font;
 }
 
 void
@@ -1500,13 +1501,16 @@ emacs_skia_font_get_glyph_extents (
   if (!font || !glyphs || !extents || count <= 0)
     return;
 
-  /* Get bounds and widths for all glyphs */
-  std::vector<SkRect> bounds (count);
-  std::vector<SkScalar> widths (count);
+  /* Use stack buffers for common case to avoid heap allocation.  */
+  constexpr int STACK_BUF = 64;
+  SkRect stack_bounds[STACK_BUF];
+  SkScalar stack_widths[STACK_BUF];
+  SkRect *bounds_ptr = count <= STACK_BUF ? stack_bounds : new SkRect[count];
+  SkScalar *widths_ptr = count <= STACK_BUF ? stack_widths : new SkScalar[count];
 
   SkSpan<const SkGlyphID> glyph_span (glyphs, count);
-  SkSpan<SkScalar> width_span (widths.data (), count);
-  SkSpan<SkRect> bounds_span (bounds.data (), count);
+  SkSpan<SkScalar> width_span (widths_ptr, count);
+  SkSpan<SkRect> bounds_span (bounds_ptr, count);
 
   font->font.getWidthsBounds (glyph_span, width_span, bounds_span,
 			      nullptr);
@@ -1515,12 +1519,18 @@ emacs_skia_font_get_glyph_extents (
      (compatible with Cairo's cairo_text_extents_t) */
   for (int i = 0; i < count; i++)
     {
-      extents[i].x_bearing = bounds[i].left ();
-      extents[i].y_bearing = bounds[i].top ();
-      extents[i].width = bounds[i].width ();
-      extents[i].height = bounds[i].height ();
-      extents[i].x_advance = widths[i];
+      extents[i].x_bearing = bounds_ptr[i].left ();
+      extents[i].y_bearing = bounds_ptr[i].top ();
+      extents[i].width = bounds_ptr[i].width ();
+      extents[i].height = bounds_ptr[i].height ();
+      extents[i].x_advance = widths_ptr[i];
       extents[i].y_advance = 0; /* Horizontal fonts */
+    }
+
+  if (count > STACK_BUF)
+    {
+      delete[] bounds_ptr;
+      delete[] widths_ptr;
     }
 }
 
@@ -1533,9 +1543,13 @@ emacs_skia_font_get_glyph_bounds (emacs_skia_font_t *font,
   if (!font || !glyphs || !bounds || count <= 0)
     return;
 
-  std::vector<SkRect> sk_bounds (count);
+  /* Use stack buffer for common case.  */
+  constexpr int STACK_BUF = 64;
+  SkRect stack_sk_bounds[STACK_BUF];
+  SkRect *sk_bounds = count <= STACK_BUF ? stack_sk_bounds : new SkRect[count];
+
   SkSpan<const SkGlyphID> glyph_span (glyphs, count);
-  SkSpan<SkRect> bounds_span (sk_bounds.data (), count);
+  SkSpan<SkRect> bounds_span (sk_bounds, count);
 
   font->font.getBounds (glyph_span, bounds_span, nullptr);
 
@@ -1546,6 +1560,9 @@ emacs_skia_font_get_glyph_bounds (emacs_skia_font_t *font,
       bounds[i].right = sk_bounds[i].right ();
       bounds[i].bottom = sk_bounds[i].bottom ();
     }
+
+  if (count > STACK_BUF)
+    delete[] sk_bounds;
 }
 
 int
@@ -1680,7 +1697,8 @@ emacs_skia_image_create_from_encoded (const void *data, size_t size)
 void
 emacs_skia_image_destroy (emacs_skia_image_t *image)
 {
-  delete image;
+  if (image)
+    delete image;
 }
 
 int
@@ -1755,7 +1773,8 @@ emacs_skia_path_create (void)
 void
 emacs_skia_path_destroy (emacs_skia_path_t *path)
 {
-  delete path;
+  if (path)
+    delete path;
 }
 
 void
@@ -2194,7 +2213,8 @@ emacs_skia_image_transform_create (void)
 void
 emacs_skia_image_transform_destroy (emacs_skia_image_transform_t *transform)
 {
-  delete transform;
+  if (transform)
+    delete transform;
 }
 
 void

@@ -4552,14 +4552,13 @@ if test "${with_skia}" = "yes"; then
   fi
 
   if test "$HAVE_SKIA" = "yes"; then
+    AC_MSG_RESULT([yes])
     AC_DEFINE([USE_SKIA], [1], [Define to 1 if using Skia for drawing.])
     CFLAGS="$CFLAGS $SKIA_CFLAGS"
     CXXFLAGS="$CXXFLAGS $SKIA_CFLAGS"
-    dnl Ensure we link with C++ standard library
-    case "$SKIA_LIBS" in
-      *-lstdc++*) ;;
-      *) SKIA_LIBS="$SKIA_LIBS -lstdc++" ;;
-    esac
+    dnl C++ standard library linking is handled by using $(CXX) for
+    dnl the link step in Makefile.in, which is portable across both
+    dnl libstdc++ and libc++ systems.
 
     dnl Auto-detect OpenGL support for Skia GPU acceleration
     dnl We use libepoxy which GTK3 already depends on
@@ -4600,7 +4599,6 @@ if test "${with_skia}" = "yes"; then
 
     AC_SUBST([SKIA_CFLAGS])
     AC_SUBST([SKIA_LIBS])
-    AC_MSG_RESULT([yes])
   else
     AC_MSG_RESULT([no])
     AC_MSG_WARN([Skia requested but not found. Install Skia or set SKIA_DIR/SKIA_CFLAGS/SKIA_LIBS.])

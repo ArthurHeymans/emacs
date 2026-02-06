@@ -2048,16 +2048,35 @@ pgtk_skia_set_clip_rectangles (struct frame *f,
 			       emacs_skia_canvas_t *canvas,
 			       XRectangle *rectangles, int n)
 {
-  if (n > 0)
+  if (n <= 0)
+    return;
+
+  if (n == 1)
     {
+      /* Single rectangle: clip directly (most common case).  */
+      emacs_skia_rect_t rect
+	= { rectangles[0].x, rectangles[0].y,
+	    rectangles[0].x + rectangles[0].width,
+	    rectangles[0].y + rectangles[0].height };
+      emacs_skia_canvas_clip_rect (canvas, &rect);
+    }
+  else
+    {
+      /* Multiple rectangles: build a path for their union.
+	 In Skia, successive clipRect calls INTERSECT the regions,
+	 but we need UNION semantics (matching Cairo's behavior).
+	 Use a path containing all rectangles and clip to that.  */
+      emacs_skia_path_t *path = emacs_skia_path_create ();
       for (int i = 0; i < n; i++)
 	{
 	  emacs_skia_rect_t rect
 	    = { rectangles[i].x, rectangles[i].y,
 		rectangles[i].x + rectangles[i].width,
 		rectangles[i].y + rectangles[i].height };
-	  emacs_skia_canvas_clip_rect (canvas, &rect);
+	  emacs_skia_path_add_rect (path, &rect);
 	}
+      emacs_skia_canvas_clip_path (canvas, path);
+      emacs_skia_path_destroy (path);
     }
 }
 #endif
@@ -3025,6 +3044,8 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 	  {
 #ifdef USE_SKIA
 	    canvas = pgtk_begin_skia_clip (next->f);
+	    if (!canvas)
+	      continue;
 	    pgtk_set_glyph_string_gc (next);
 	    pgtk_skia_set_glyph_string_clipping (next, canvas);
 #else
@@ -3050,6 +3071,8 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 
 #ifdef USE_SKIA
   canvas = pgtk_begin_skia_clip (s->f);
+  if (!canvas)
+    goto done;
 #else
   cr = pgtk_begin_cr_clip (s->f);
 #endif
@@ -3352,6 +3375,7 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 
   /* Reset clipping.  */
 #ifdef USE_SKIA
+ done:
   pgtk_end_skia_clip (s->f);
 #else
   pgtk_end_cr_clip (s->f);
@@ -4719,6 +4743,9 @@ recover_from_visible_bell (struct atimer *timer)
       emacs_skia_surface_destroy (
 	FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
       FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
+      /* Queue a re-render so GtkGLArea repaints without the bell.  */
+      if (FRAME_GL_AREA (f))
+	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
     }
 #else
   if (FRAME_X_OUTPUT (f)->cr_surface_visible_bell != NULL)
@@ -8732,6 +8759,12 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
   /* The GL context is about to be destroyed.  We must clean up all
      Skia resources that depend on it before this happens.  */
 
+  /* Flush all pending GPU operations before destroying resources.  */
+  if (FRAME_SKIA_SURFACE (f))
+    emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+
   /* Destroy Skia surface first (it references the GL context).  */
   if (FRAME_SKIA_SURFACE (f))
     {
@@ -9578,11 +9611,16 @@ pgtk_skia_set_paint_color (struct frame *f, unsigned long color,
 
   emacs_skia_paint_set_color (paint, EMACS_SKIA_COLOR (a, r, g, b));
 
-  if (getenv ("EMACS_SKIA_DEBUG_COLOR"))
-    fprintf (stderr, "SKIA_COLOR: rgba(%d,%d,%d,%d) blend=%s alpha_bg=%.2f\n",
-	     r, g, b, a,
-	     respects_alpha_background ? "SRC" : "SRC_OVER",
-	     f->alpha_background);
+  {
+    static int debug_color = -1;
+    if (debug_color == -1)
+      debug_color = getenv ("EMACS_SKIA_DEBUG_COLOR") != NULL;
+    if (debug_color)
+      fprintf (stderr, "SKIA_COLOR: rgba(%d,%d,%d,%d) blend=%s alpha_bg=%.2f\n",
+	       r, g, b, a,
+	       respects_alpha_background ? "SRC" : "SRC_OVER",
+	       f->alpha_background);
+  }
 }
 
 /* Destroy only the Skia surface, preserving GL context and GtkGLArea.
@@ -9663,12 +9701,17 @@ pgtk_skia_fill_rectangle (struct frame *f, unsigned long color, int x,
   emacs_skia_irect_t rect = { x, y, x + width, y + height };
   emacs_skia_canvas_draw_irect (canvas, &rect, FRAME_SKIA_PAINT (f));
 
-  if (getenv ("EMACS_SKIA_DEBUG_RECT"))
-    fprintf (stderr, "SKIA_RECT: frame=%p child=%d fill (%d,%d)-(%d,%d) "
-	     "color=0x%08lx respect_alpha=%d alpha_bg=%.2f\n",
-	     (void *)f, FRAME_PARENT_FRAME (f) != NULL,
-	     x, y, x + width, y + height, color, respect_alpha_background,
-	     f->alpha_background);
+  {
+    static int debug_rect = -1;
+    if (debug_rect == -1)
+      debug_rect = getenv ("EMACS_SKIA_DEBUG_RECT") != NULL;
+    if (debug_rect)
+      fprintf (stderr, "SKIA_RECT: frame=%p child=%d fill (%d,%d)-(%d,%d) "
+	       "color=0x%08lx respect_alpha=%d alpha_bg=%.2f\n",
+	       (void *)f, FRAME_PARENT_FRAME (f) != NULL,
+	       x, y, x + width, y + height, color, respect_alpha_background,
+	       f->alpha_background);
+  }
 
   pgtk_end_skia_clip (f);
 }
@@ -10061,7 +10104,6 @@ pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type)
   struct frame *f;
   int width, height;
   struct skia_export_accumulator acc = { Qnil };
-  specpdl_ref count = SPECPDL_INDEX ();
   bool is_pdf = NILP (type) || EQ (type, Qpdf);
   bool is_svg = EQ (type, Qsvg);
   bool is_png = EQ (type, Qpng);
@@ -10202,7 +10244,6 @@ pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type)
     }
 
   unblock_input ();
-  unbind_to (count, Qnil);
 
   return CALLN (Fapply, Qconcat, Fnreverse (acc.data));
 }
