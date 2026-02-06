@@ -2074,12 +2074,16 @@ make_treesit_query (Lisp_Object query, Lisp_Object language)
   return make_lisp_ptr (lisp_query, Lisp_Vectorlike);
 }
 
-/* The following two functions are called from alloc.c:cleanup_vector.  */
+/* The following two functions are called from alloc.c:cleanup_vector.
+   Since this runs during gc_sweep, we must not call Lisp code (like
+   Fkill_buffer) here—doing so would run hooks while the heap is in
+   an inconsistent state.  Instead, we defer the buffer kill to after
+   GC completes.  See bug#XXXXX.  */
 void
 treesit_delete_parser (struct Lisp_TS_Parser *lisp_parser)
 {
   if (lisp_parser->need_to_gc_buffer)
-    Fkill_buffer (lisp_parser->buffer);
+    defer_kill_buffer_after_gc (lisp_parser->buffer);
   ts_tree_delete (lisp_parser->tree);
   ts_parser_delete (lisp_parser->parser);
 }
@@ -2838,7 +2842,11 @@ optimized; for heavy workload, use a temporary buffer instead.  */)
 
   Lisp_Object name_str = build_string (" *treesit-parse-string*");
   Lisp_Object buffer_name = Fgenerate_new_buffer_name (name_str, Qnil);
-  Lisp_Object buffer = Fget_buffer_create (buffer_name, Qnil);
+  /* Pass Qt for INHIBIT-BUFFER-HOOKS since this is an internal
+     temporary buffer; running kill-buffer-hook etc. is unnecessary
+     and was the root cause of a crash when the buffer was killed
+     during GC.  See bug#XXXXX.  */
+  Lisp_Object buffer = Fget_buffer_create (buffer_name, Qt);
 
   struct buffer *old_buffer = current_buffer;
   set_buffer_internal (XBUFFER (buffer));

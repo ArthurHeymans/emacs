@@ -250,6 +250,11 @@ extern void treesit_delete_query (struct Lisp_TS_Query *);
 extern bool treesit_named_node_p (TSNode);
 extern bool treesit_node_eq (Lisp_Object, Lisp_Object);
 
+/* Defined in alloc.c.  Queue a buffer to be killed after GC
+   completes, rather than during gc_sweep where Lisp code cannot
+   safely run.  */
+extern void defer_kill_buffer_after_gc (Lisp_Object);
+
 #endif	/* HAVE_TREE_SITTER */
 
 extern void syms_of_treesit (void);

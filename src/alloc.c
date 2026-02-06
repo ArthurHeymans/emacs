@@ -506,6 +506,16 @@ Lisp_Object const *staticvec[NSTATICS];
 
 int staticidx;
 
+#ifdef HAVE_TREE_SITTER
+/* Buffers that need to be killed after GC completes.  This is used by
+   treesit_delete_parser to defer Fkill_buffer calls that would
+   otherwise run during gc_sweep, where running Lisp code is unsafe.
+   We use a C-level array because we cannot cons during GC.  */
+static Lisp_Object *deferred_buffer_kills;
+static int deferred_buffer_kills_count;
+static int deferred_buffer_kills_capacity;
+#endif /* HAVE_TREE_SITTER */
+
 /* Extract the pointer hidden within O.  */
 
 static ATTRIBUTE_NO_SANITIZE_UNDEFINED void *
@@ -729,6 +739,26 @@ xnrealloc (void *pa, ptrdiff_t nitems, ptrdiff_t item_size)
   return xrealloc (pa, nbytes);
 }
 
+
+#ifdef HAVE_TREE_SITTER
+/* Queue BUFFER to be killed after GC completes.  This must be used
+   instead of Fkill_buffer during GC sweep, where running Lisp code is
+   unsafe.  */
+void
+defer_kill_buffer_after_gc (Lisp_Object buffer)
+{
+  if (deferred_buffer_kills_count >= deferred_buffer_kills_capacity)
+    {
+      int new_cap = (deferred_buffer_kills_capacity == 0
+		     ? 4
+		     : 2 * deferred_buffer_kills_capacity);
+      deferred_buffer_kills = xnrealloc (deferred_buffer_kills, new_cap,
+					 sizeof *deferred_buffer_kills);
+      deferred_buffer_kills_capacity = new_cap;
+    }
+  deferred_buffer_kills[deferred_buffer_kills_count++] = buffer;
+}
+#endif /* HAVE_TREE_SITTER */
 
 /* Grow PA, which points to an array of *NITEMS items, and return the
    location of the reallocated array, updating *NITEMS to reflect its
@@ -5959,6 +5989,18 @@ garbage_collect (void)
 
   /* GC is complete: now we can run our finalizer callbacks.  */
   run_finalizers (&doomed_finalizers);
+
+#ifdef HAVE_TREE_SITTER
+  /* Kill any buffers that treesit_delete_parser deferred during
+     gc_sweep.  Now that GC is complete, it is safe to run Lisp code
+     like kill-buffer-hook.  */
+  while (deferred_buffer_kills_count > 0)
+    {
+      Lisp_Object buf = deferred_buffer_kills[--deferred_buffer_kills_count];
+      if (!NILP (buf) && BUFFER_LIVE_P (XBUFFER (buf)))
+	Fkill_buffer (buf);
+    }
+#endif
 
 #ifdef HAVE_WINDOW_SYSTEM
   /* Eject unused image cache entries.  */
