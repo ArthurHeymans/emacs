@@ -732,7 +732,7 @@ ifneq ($(SKIA_CXX_OBJ),)
 skia:
 	$(MKDIR_P) skia
 
-skia/emacs_skia.o: $(srcdir)/skia/emacs_skia.cpp skia $(config_h)
+skia/emacs_skia.o: $(srcdir)/skia/emacs_skia.cpp $(srcdir)/skia/emacs_skia.h skia $(config_h)
 	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(SKIA_CFLAGS) -o $@ $<
 endif
 

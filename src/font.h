@@ -1027,7 +1027,7 @@ extern void font_deferred_log (const char *, Lisp_Object, Lisp_Object);
 INLINE bool
 font_data_structures_may_be_ill_formed (void)
 {
-#if defined USE_CAIRO || defined USE_BE_CAIRO
+#if defined USE_CAIRO || defined USE_BE_CAIRO || defined USE_SKIA
   /* Although this works around Bug#20890, it is probably not the
      right thing to do.  */
   return gc_in_progress;

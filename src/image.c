@@ -417,9 +417,9 @@ skia_put_image_to_skia_data (struct image *img)
 		{
 		  uint8_t alpha = mask_row[x];
 		  uint32_t pixel = row[x];
-		  int r = ((pixel >> 16) & 0xFF) * alpha / 255;
-		  int g = ((pixel >> 8) & 0xFF) * alpha / 255;
-		  int b = (pixel & 0xFF) * alpha / 255;
+		  int r = (((pixel >> 16) & 0xFF) * alpha + 0x7f) / 0xff;
+		  int g = (((pixel >> 8) & 0xFF) * alpha + 0x7f) / 0xff;
+		  int b = ((pixel & 0xFF) * alpha + 0x7f) / 0xff;
 		  row[x] = (alpha << 24) | (r << 16) | (g << 8) | b;
 		}
 	    }

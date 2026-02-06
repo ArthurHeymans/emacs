@@ -41,6 +41,9 @@ typedef struct pgtk_output xp_output;
 #include "blockinput.h"
 #include "window.h"
 #include "gtkutil.h"
+#ifdef USE_SKIA
+#include "skia/emacs_skia.h"
+#endif
 #include "termhooks.h"
 #include "keyboard.h"
 #include "coding.h"
@@ -588,6 +591,77 @@ xg_get_image_for_pixmap (struct frame *f,
         gtk_image_set_from_pixbuf (old_widget, icon_buf);
 
       g_object_unref (G_OBJECT (icon_buf));
+    }
+#endif
+
+#ifdef USE_SKIA
+  /* For Skia-only builds (without Cairo), create a GtkImage from
+     the Skia image data via a temporary pixbuf.  */
+  if (!old_widget && img->skia_data)
+    {
+      emacs_skia_image_t *skia_img = img->skia_data;
+      int w = emacs_skia_image_get_width (skia_img);
+      int h = emacs_skia_image_get_height (skia_img);
+      if (w > 0 && h > 0)
+	{
+	  /* Create a raster surface, draw the image, read pixels back.  */
+	  emacs_skia_surface_t *tmp
+	    = emacs_skia_surface_create_raster (w, h);
+	  if (tmp)
+	    {
+	      emacs_skia_canvas_t *c
+		= emacs_skia_surface_get_canvas (tmp);
+	      if (c)
+		{
+		  emacs_skia_canvas_clear (c, EMACS_SKIA_COLOR (0, 0, 0, 0));
+		  emacs_skia_canvas_draw_image (c, skia_img, 0, 0, NULL);
+		  void *pixels = emacs_skia_surface_get_pixels (tmp);
+		  if (pixels)
+		    {
+		      /* Pixels are in premultiplied ARGB format.  Convert to
+			 GdkPixbuf RGBA (non-premultiplied).  */
+		      GdkPixbuf *pixbuf
+			= gdk_pixbuf_new (GDK_COLORSPACE_RGB, TRUE, 8, w, h);
+		      if (pixbuf)
+			{
+			  guchar *pb_pixels = gdk_pixbuf_get_pixels (pixbuf);
+			  int pb_stride = gdk_pixbuf_get_rowstride (pixbuf);
+			  uint32_t *src = (uint32_t *) pixels;
+			  for (int y = 0; y < h; y++)
+			    {
+			      guchar *dst = pb_pixels + y * pb_stride;
+			      for (int x = 0; x < w; x++)
+				{
+				  uint32_t p = src[y * w + x];
+				  uint8_t a = (p >> 24) & 0xff;
+				  uint8_t r = (p >> 16) & 0xff;
+				  uint8_t g = (p >> 8) & 0xff;
+				  uint8_t b = p & 0xff;
+				  /* Undo premultiplication.  */
+				  if (a > 0 && a < 255)
+				    {
+				      r = (r * 255 + a / 2) / a;
+				      g = (g * 255 + a / 2) / a;
+				      b = (b * 255 + a / 2) / a;
+				    }
+				  dst[x * 4 + 0] = r;
+				  dst[x * 4 + 1] = g;
+				  dst[x * 4 + 2] = b;
+				  dst[x * 4 + 3] = a;
+				}
+			    }
+			  if (!old_widget)
+			    old_widget
+			      = GTK_IMAGE (gtk_image_new_from_pixbuf (pixbuf));
+			  else
+			    gtk_image_set_from_pixbuf (old_widget, pixbuf);
+			  g_object_unref (G_OBJECT (pixbuf));
+			}
+		    }
+		}
+	      emacs_skia_surface_destroy (tmp);
+	    }
+	}
     }
 #endif
 
