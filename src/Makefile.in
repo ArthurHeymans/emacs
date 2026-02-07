@@ -729,11 +729,11 @@ $(ALLOBJS): globals.h
 
 ## Skia C++ wrapper
 ifneq ($(SKIA_CXX_OBJ),)
-skia:
-	$(MKDIR_P) skia
+skia $(DEPDIR)/skia:
+	$(MKDIR_P) skia $(DEPDIR)/skia
 
-skia/emacs_skia.o: $(srcdir)/skia/emacs_skia.cpp $(srcdir)/skia/emacs_skia.h skia $(config_h)
-	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(SKIA_CFLAGS) -o $@ $<
+skia/emacs_skia.o: $(srcdir)/skia/emacs_skia.cpp $(srcdir)/skia/emacs_skia.h skia $(DEPDIR)/skia $(config_h)
+	$(AM_V_CXX)$(CXX) -c $(CPPFLAGS) $(ALL_CXX_CFLAGS) $(DEPFLAGS) $(SKIA_CFLAGS) -o $@ $<
 endif
 
 LIBEGNU_ARCHIVE = $(lib)/lib$(if $(HYBRID_MALLOC),e)gnu.a
@@ -864,7 +864,7 @@ versionclean:
 	rm -f emacs$(EXEEXT) emacs-*.*.*[0-9]$(EXEEXT) emacs-*.*.*[0-9].pdmp
 	rm -f ../etc/DOC*
 clean: mostlyclean versionclean
-	rm -f $(DEPDIR)/*
+	rm -rf $(DEPDIR)/*
 
 ## bootstrap-clean is used to clean up just before a bootstrap.
 ## It should remove all files generated during a compilation/bootstrap,
