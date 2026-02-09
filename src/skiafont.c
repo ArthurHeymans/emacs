@@ -203,8 +203,13 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   FcConfigSubstitute (NULL, pat, FcMatchPattern);
   FcDefaultSubstitute (pat);
   match = FcFontMatch (NULL, pat, &result);
-  ftfont_fix_match (pat, match);
   FcPatternDestroy (pat);
+  if (!match)
+    {
+      unblock_input ();
+      return Qnil;
+    }
+  ftfont_fix_match (NULL, match);
 
   /* Get font index from the match.  */
   FcPatternGetInteger (match, FC_INDEX, 0, &font_index);
@@ -295,8 +300,10 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 	  }
 	else
 	  {
-	    font->height = lround (extents.height);
-	    font->descent = font->height - font->ascent;
+	    /* Fallback to max_x_advance if we couldn't measure
+	     * characters.  */
+	    font->min_width = font->average_width = font->space_width
+	      = font->max_width = lround (extents.max_x_advance);
 	  }
       }
 
@@ -336,7 +343,8 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 	    font->average_width = total_width / n;
 	    font->min_width = min_w;
 	    font->max_width = max_w;
-	    font->space_width = space_w > 0 ? space_w : font->average_width;
+	    font->space_width
+	      = space_w > 0 ? space_w : font->average_width;
 	  }
 	else
 	  {
@@ -355,7 +363,7 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
       font->descent = pixel_size / 4;
       font->height = font->ascent + font->descent;
       font->min_width = font->average_width = font->space_width
-	= pixel_size / 2;
+	= font->max_width = pixel_size / 2;
     }
 
   /* Get underline metrics from FreeType directly.  */
@@ -381,7 +389,7 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
       /* Compute bitmap_position_unit for bitmap fonts (Bug#73752).  */
       if (ft_face->units_per_EM)
 	skiafont_info->base.bitmap_position_unit = 0;
-      else if (ft_face->size
+      else if (skiafont_info->skia_font && ft_face->size
 	       && ft_face->size->metrics.height > 0)
 	{
 	  emacs_skia_font_extents_t ext;
@@ -424,6 +432,8 @@ skiafont_close (struct font *font)
     = (struct skia_font_info *) font;
   int i;
 
+  block_input ();
+
   if (skiafont_info->skia_font)
     {
       emacs_skia_font_destroy (skiafont_info->skia_font);
@@ -434,8 +444,6 @@ skiafont_close (struct font *font)
       emacs_skia_typeface_destroy (skiafont_info->skia_typeface);
       skiafont_info->skia_typeface = NULL;
     }
-
-  block_input ();
 
   /* Close the FreeType face.  */
   if (skiafont_info->base.ft_face)

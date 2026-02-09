@@ -2129,18 +2129,31 @@ emacs_skia_surface_write_to_png (emacs_skia_surface_t *surface,
   SkPixmap pixmap;
   if (!image->peekPixels (&pixmap))
     {
-      /* For GPU surfaces, we need to read back the pixels.  */
+      /* For GPU surfaces, we need to read back the pixels.
+	 The readPixels overload that takes GrDirectContext is
+	 required for GPU-backed images (Ganesh backend).  Without
+	 it, readPixels silently fails on GPU images.  */
       SkImageInfo info
 	= SkImageInfo::Make (image->width (), image->height (),
 			     kRGBA_8888_SkColorType,
 			     kUnpremul_SkAlphaType);
       std::vector<uint8_t> pixels (info.computeMinByteSize ());
-      if (!image->readPixels (info, pixels.data (), info.minRowBytes (),
-			      0, 0))
+#ifdef SK_GL
+      GrDirectContext *ctx
+	= surface->context ? surface->context.get () : nullptr;
+      if (!image->readPixels (ctx, info, pixels.data (),
+			      info.minRowBytes (), 0, 0))
 	return false;
+#else
+      if (!image->readPixels (info, pixels.data (),
+			      info.minRowBytes (), 0, 0))
+	return false;
+#endif
 
-      SkPixmap temp_pixmap (info, pixels.data (), info.minRowBytes ());
-      return encode_png_to_callback (temp_pixmap, write_fn, write_ctx);
+      SkPixmap temp_pixmap (info, pixels.data (),
+			    info.minRowBytes ());
+      return encode_png_to_callback (temp_pixmap, write_fn,
+				     write_ctx);
     }
 
   return encode_png_to_callback (pixmap, write_fn, write_ctx);
@@ -2159,12 +2172,14 @@ emacs_skia_image_write_to_png (emacs_skia_image_t *image,
   SkPixmap pixmap;
   if (!image->image->peekPixels (&pixmap))
     {
-      /* Need to read pixels back.  */
-      SkImageInfo info
-	= SkImageInfo::Make (image->image->width (),
-			     image->image->height (),
-			     kRGBA_8888_SkColorType,
-			     kUnpremul_SkAlphaType);
+      /* Need to read pixels back.  For deferred images (from encoded
+	 data), readPixels without a context is fine.  For GPU-backed
+	 images, the caller should use surface_write_to_png instead.
+       */
+      SkImageInfo info = SkImageInfo::Make (image->image->width (),
+					    image->image->height (),
+					    kRGBA_8888_SkColorType,
+					    kUnpremul_SkAlphaType);
       std::vector<uint8_t> pixels (info.computeMinByteSize ());
       if (!image->image->readPixels (info, pixels.data (),
 				     info.minRowBytes (), 0, 0))

@@ -1921,6 +1921,11 @@ pgtk_fill_trapezoid_for_relief (struct frame *f, unsigned long color,
     return;
   emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
   emacs_skia_path_t *path = emacs_skia_path_create ();
+  if (!path)
+    {
+      pgtk_end_skia_clip (f);
+      return;
+    }
 
   emacs_skia_paint_set_color (paint, pgtk_color_to_skia (color));
   emacs_skia_paint_set_blend_mode (paint, EMACS_SKIA_BLEND_SRC_OVER);
@@ -1974,6 +1979,11 @@ pgtk_erase_corners_for_relief (struct frame *f, unsigned long color,
   emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
   emacs_skia_path_t *clip_path = emacs_skia_path_create ();
   int i;
+  if (!clip_path)
+    {
+      pgtk_end_skia_clip (f);
+      return;
+    }
 
   /* Build clipping path from corner arcs */
   for (i = 0; i < CORNER_LAST; i++)
@@ -2116,6 +2126,8 @@ pgtk_skia_set_clip_rectangles (struct frame *f,
 	 but we need UNION semantics (matching Cairo's behavior).
 	 Use a path containing all rectangles and clip to that.  */
       emacs_skia_path_t *path = emacs_skia_path_create ();
+      if (!path)
+	return;
       for (int i = 0; i < n; i++)
 	{
 	  emacs_skia_rect_t rect
@@ -2370,6 +2382,11 @@ pgtk_draw_horizontal_wave (struct frame *f, unsigned long color,
   emacs_skia_path_t *path = emacs_skia_path_create ();
   double dx = wave_length, dy = height - 1;
   int xoffset, n;
+  if (!path)
+    {
+      pgtk_end_skia_clip (f);
+      return;
+    }
 
   emacs_skia_canvas_save (canvas);
   emacs_skia_rect_t clip = { x, y, x + width, y + height };
@@ -3846,12 +3863,23 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
       if (snapshot)
 	{
 	  emacs_skia_canvas_t *canvas = pgtk_begin_skia_clip (f);
+	  if (!canvas)
+	    {
+	      emacs_skia_image_destroy (snapshot);
+	      return;
+	    }
 
 	  /* Use a fresh paint to avoid state pollution from previous
 	     drawing operations.  The shared paint might have color,
 	     alpha, or other properties set that could affect the
 	     blit.  */
 	  emacs_skia_paint_t *copy_paint = emacs_skia_paint_create ();
+	  if (!copy_paint)
+	    {
+	      pgtk_end_skia_clip (f);
+	      emacs_skia_image_destroy (snapshot);
+	      return;
+	    }
 	  emacs_skia_paint_set_blend_mode (copy_paint,
 					   EMACS_SKIA_BLEND_SRC);
 
@@ -4907,7 +4935,23 @@ pgtk_flash (struct frame *f)
     }
 
   canvas = emacs_skia_surface_get_canvas (surface);
+  if (!canvas)
+    {
+      emacs_skia_surface_destroy (surface);
+      unblock_input ();
+      return;
+    }
   paint = emacs_skia_paint_create ();
+  if (!paint)
+    {
+      emacs_skia_surface_destroy (surface);
+      unblock_input ();
+      return;
+    }
+
+  /* Flush the original surface before taking a snapshot, in case it
+     is GPU-backed and has pending draw operations.  */
+  emacs_skia_surface_flush (surface_orig);
 
   /* Copy original surface content */
   snapshot = emacs_skia_surface_make_image_snapshot (surface_orig);
@@ -9757,11 +9801,22 @@ pgtk_begin_skia_clip (struct frame *f)
 	}
 
       canvas = emacs_skia_surface_get_canvas (FRAME_SKIA_SURFACE (f));
+      if (!canvas)
+	{
+	  fprintf (stderr,
+		   "Skia: Failed to get canvas from surface for frame %p\n",
+		   (void *) f);
+	  return NULL;
+	}
       FRAME_SKIA_CANVAS (f) = canvas;
 
       /* Create a reusable paint object.  */
       if (!FRAME_SKIA_PAINT (f))
-	FRAME_SKIA_PAINT (f) = emacs_skia_paint_create ();
+	{
+	  FRAME_SKIA_PAINT (f) = emacs_skia_paint_create ();
+	  if (!FRAME_SKIA_PAINT (f))
+	    return NULL;
+	}
 
       /* Clear the newly created surface with the background color.
 	 This is critical for GL surfaces where the FBO starts with

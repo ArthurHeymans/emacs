@@ -396,9 +396,15 @@ skia_put_image_to_skia_data (struct image *img)
       int stride = img->pixmap->bytes_per_line;
       unsigned char *data = (unsigned char *) img->pixmap->data;
 
+      if (width <= 0 || height <= 0 || stride <= 0)
+	{
+	  img->load_failed_p = 1;
+	  return;
+	}
+
       /* Create a copy of the data since Skia needs to own it.
 	 For Skia, we create a copy with premultiplied alpha.  */
-      size_t data_size = stride * height;
+      size_t data_size = (size_t) stride * height;
       unsigned char *data_copy = xmalloc (data_size);
       memcpy (data_copy, data, data_size);
 
@@ -417,8 +423,10 @@ skia_put_image_to_skia_data (struct image *img)
 		{
 		  uint8_t alpha = mask_row[x];
 		  uint32_t pixel = row[x];
-		  int r = (((pixel >> 16) & 0xFF) * alpha + 0x7f) / 0xff;
-		  int g = (((pixel >> 8) & 0xFF) * alpha + 0x7f) / 0xff;
+		  int r
+		    = (((pixel >> 16) & 0xFF) * alpha + 0x7f) / 0xff;
+		  int g
+		    = (((pixel >> 8) & 0xFF) * alpha + 0x7f) / 0xff;
 		  int b = ((pixel & 0xFF) * alpha + 0x7f) / 0xff;
 		  row[x] = (alpha << 24) | (r << 16) | (g << 8) | b;
 		}
@@ -441,6 +449,8 @@ skia_put_image_to_skia_data (struct image *img)
 						    data_copy, stride,
 						    has_alpha);
       xfree (data_copy);
+      if (!img->skia_data)
+	img->load_failed_p = 1;
     }
 }
 #endif /* USE_SKIA */
@@ -1993,6 +2003,11 @@ prepare_image_for_display (struct frame *f, struct image *img)
       IMAGE_BACKGROUND_TRANSPARENT (img, f, img->mask);
       if (img->skia_data == NULL)
 	skia_put_image_to_skia_data (img);
+      if (img->skia_data == NULL)
+	{
+	  img->load_failed_p = 1;
+	  img->type->free_img (f, img);
+	}
       unblock_input ();
     }
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
