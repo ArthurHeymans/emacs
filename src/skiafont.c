@@ -218,6 +218,7 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 				   Qskia, entity, size);
   skiafont_info
     = (struct skia_font_info *) XFONT_OBJECT (font_object);
+
   font = &skiafont_info->base.font;
   font->pixel_size = size;
   font->driver = &skiafont_driver;
@@ -414,6 +415,7 @@ skiafont_open (struct frame *f, Lisp_Object entity, int pixel_size)
       /* Default underline metrics.  */
       font->underline_position = -1;
       font->underline_thickness = 1;
+      /* ft_face is NULL or failed to load, nothing to clean up.  */
     }
 
   FcPatternDestroy (match);

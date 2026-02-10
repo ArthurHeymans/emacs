@@ -380,6 +380,7 @@ get_gl_proc (void *ctx, const char *name)
 
   return (GrGLFuncPtr) dlsym (gl_lib_handle, name);
 }
+
 #endif
 
 emacs_skia_gl_context_t *
@@ -510,6 +511,15 @@ emacs_skia_fence_create (void)
 {
   auto *fence = new emacs_skia_fence_t;
   fence->sync = glFenceSync (GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+  /* glFenceSync returns 0 on failure.  */
+  if (!fence->sync)
+    {
+      SKIA_LOG_ERROR ("fence_create: glFenceSync failed (no valid GL context?)");
+      delete fence;
+      return nullptr;
+    }
+
   return fence;
 }
 
@@ -1366,11 +1376,13 @@ emacs_skia_typeface_create_from_fc_pattern (FcPattern *pattern)
 const char *
 emacs_skia_typeface_get_path (emacs_skia_typeface_t *typeface)
 {
+  if (!typeface)
+    return nullptr;
+
   /* Skia doesn't expose the font file path directly.
      This would need platform-specific code or tracking during
      creation. For now, return nullptr - callers should use the path
      they originally provided.  */
-  (void) typeface;
   return nullptr;
 }
 
@@ -1386,16 +1398,15 @@ emacs_skia_typeface_get_index (emacs_skia_typeface_t *typeface)
 emacs_skia_font_t *
 emacs_skia_font_create (emacs_skia_typeface_t *typeface, float size)
 {
+  if (!typeface || !typeface->typeface)
+    {
+      SKIA_LOG_ERROR ("font_create: invalid typeface");
+      return nullptr;
+    }
+
   auto font = new emacs_skia_font_t;
-  if (typeface && typeface->typeface)
-    {
-      font->font = SkFont (typeface->typeface, size);
-      font->typeface = typeface->typeface;
-    }
-  else
-    {
-      font->font = SkFont (nullptr, size);
-    }
+  font->font = SkFont (typeface->typeface, size);
+  font->typeface = typeface->typeface;
   font->font.setSubpixel (true);
   return font;
 }
@@ -1898,6 +1909,12 @@ emacs_skia_document_create_pdf (emacs_skia_write_fn write_fn,
 				void *write_ctx, float width,
 				float height)
 {
+  if (!write_fn)
+    {
+      SKIA_LOG_ERROR ("document_create_pdf: write_fn is NULL");
+      return nullptr;
+    }
+
   auto stream
     = std::make_unique<CallbackWStream> (write_fn, write_ctx);
 
@@ -2014,14 +2031,23 @@ emacs_skia_document_close (emacs_skia_document_t *doc)
 static std::map<SkCanvas *, emacs_skia_svg_canvas_data *>
   svg_canvas_map;
 
+/* Track number of canvases for leak detection.  */
+static size_t svg_canvas_count = 0;
+
 /* Clean up any remaining SVG canvases that were not properly finished.
    Called from emacs_skia_cleanup() to prevent memory leaks.  */
 static void
 cleanup_svg_canvas_map (void)
 {
+  if (svg_canvas_count > 0)
+    {
+      SKIA_LOG_ERROR ("cleanup_svg_canvas_map: leaking %zu SVG canvas(es)",
+                      svg_canvas_count);
+    }
   for (auto &entry : svg_canvas_map)
     delete entry.second;
   svg_canvas_map.clear ();
+  svg_canvas_count = 0;
 }
 
 emacs_skia_canvas_t *
@@ -2029,6 +2055,12 @@ emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
 			      void *write_ctx, float width,
 			      float height)
 {
+  if (!write_fn)
+    {
+      SKIA_LOG_ERROR ("svg_canvas_create: write_fn is NULL");
+      return nullptr;
+    }
+
   auto stream
     = std::make_unique<CallbackWStream> (write_fn, write_ctx);
 
@@ -2043,6 +2075,7 @@ emacs_skia_svg_canvas_create (emacs_skia_write_fn write_fn,
   data->canvas = std::move (canvas);
 
   svg_canvas_map[data->canvas.get ()] = data;
+  svg_canvas_count++;
 
   /* Use the per-SVG-canvas wrapper for thread safety.  */
   data->canvas_wrapper.canvas = data->canvas.get ();
@@ -2061,6 +2094,8 @@ emacs_skia_svg_canvas_finish (emacs_skia_canvas_t *canvas)
       emacs_skia_svg_canvas_data *data = it->second;
       /* Deleting the canvas flushes and finishes the SVG output.  */
       svg_canvas_map.erase (it);
+      eassert (svg_canvas_count > 0);
+      svg_canvas_count--;
       delete data;
     }
 }
@@ -2318,6 +2353,14 @@ emacs_skia_format_stride_for_width (int format, int width)
 {
   /* format: 0 = A8 (1 byte per pixel), 1 = RGB24/ARGB32 (4 bytes per pixel) */
   int bytes_per_pixel = (format == 0) ? 1 : 4;
+
+  /* Check for integer overflow.  */
+  if (width > INT_MAX / bytes_per_pixel)
+    {
+      SKIA_LOG_ERROR ("format_stride_for_width: width %d too large", width);
+      return -1;
+    }
+
   int stride = width * bytes_per_pixel;
   /* Align to 4 bytes (Skia's default alignment).  */
   return (stride + 3) & ~3;

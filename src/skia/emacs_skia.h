@@ -548,7 +548,9 @@ extern "C"
     emacs_skia_font_t *font, const emacs_skia_glyph_t *glyphs,
     int count, emacs_skia_rect_t *bounds);
 
-  /* Convert text to glyphs (UTF-8 input) */
+  /* Convert text to glyphs (UTF-8 input).
+     The caller must ensure that byte_length does not exceed the actual
+     buffer size of text to prevent buffer over-read.  */
   int emacs_skia_font_text_to_glyphs (emacs_skia_font_t *font,
 				      const char *text,
 				      size_t byte_length,

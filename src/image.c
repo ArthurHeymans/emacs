@@ -264,6 +264,11 @@ image_create_pix_container (unsigned int width, unsigned int height,
    */
   pimg->bytes_per_line
     = emacs_skia_format_stride_for_width (depth == 1 ? 0 : 1, width);
+  if (pimg->bytes_per_line < 0)
+    {
+      xfree (pimg);
+      return NULL;
+    }
 # endif
   pimg->data = xmalloc (pimg->bytes_per_line * height);
 
