@@ -9177,6 +9177,7 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
       float a = (float) f->alpha_background;
       glClearColor (r, g, b, a);
       glClear (GL_COLOR_BUFFER_BIT);
+      glFlush ();
       return TRUE;
     }
 
@@ -9237,6 +9238,10 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
 	      FRAME_GL_TIMEOUT_COUNT (f) = 0;
 	    }
 
+	  /* Flush to ensure the clear reaches the GPU before GTK
+	     presents this buffer to the compositor.  */
+	  glFlush ();
+
 	  /* Force a complete redraw so content is regenerated.  */
 	  SET_FRAME_GARBAGED (f);
 	  gtk_gl_area_queue_render (gl_area);
@@ -9266,6 +9271,9 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
       float a = (float) f->alpha_background;
       glClearColor (r, g, b, a);
       glClear (GL_COLOR_BUFFER_BIT);
+      /* Flush to ensure the clear reaches the GPU before GTK
+	 presents this buffer to the compositor.  */
+      glFlush ();
       SET_FRAME_GARBAGED (f);
       gtk_gl_area_queue_render (gl_area);
       return TRUE;
@@ -9304,6 +9312,19 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
      is needed.  */
   glBlitFramebuffer (0, 0, src_width, src_height, 0, 0, dst_width,
 		     dst_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+  /* Flush to ensure the blit is submitted to the GPU before this
+     callback returns.  Without this, the blit is merely queued in
+     the GL command pipeline and may not have completed when GTK
+     reads the GtkGLArea's FBO to composite it into the Wayland
+     surface.  This causes a race condition where the compositor
+     sees the stale (transparent) FBO content from a previous
+     NULL-surface clear, resulting in a permanently transparent
+     frame.  This is especially likely during rapid resize at
+     startup, when multiple NULL-surface clears leave transparent
+     content in the GtkGLArea buffer and the first real blit races
+     with GTK's presentation.  */
+  glFlush ();
 
   /* Restore framebuffer bindings.  */
   glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
