@@ -6929,15 +6929,14 @@ map_event (GtkWidget *widget, GdkEvent *event, gpointer *user_data)
       FRAME_X_OUTPUT (f)->has_been_visible = true;
 
 #ifdef USE_SKIA
-      /* Queue a render when window becomes visible to ensure
-	 GtkGLArea content is displayed.  This is needed because
-	 Wayland compositors may discard surface content when
-	 windows are unmapped or their state changes.  */
+      /* Wayland compositors may discard surface content when windows
+	 are unmapped.  Mark as garbaged so Emacs redisplay redraws
+	 the content.  Do NOT queue a GtkGLArea render here — redisplay
+	 hasn't run yet, so the render callback would blit a stale or
+	 empty surface.  pgtk_frame_up_to_date will queue the render
+	 after content has been drawn.  */
       if (FRAME_GL_AREA (f))
-	{
-	  gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
-	  SET_FRAME_GARBAGED (f);
-	}
+	SET_FRAME_GARBAGED (f);
 #endif
 
       if (iconified)
@@ -7023,15 +7022,14 @@ window_state_event (GtkWidget *widget, GdkEvent *event,
     store_frame_param (f, Qsticky, Qnil);
 
 #ifdef USE_SKIA
-  /* Queue a render when window state changes (fullscreen, maximize,
-     etc.) to ensure GtkGLArea content is properly displayed.  Wayland
-     compositors may require a fresh render after state transitions.
-   */
+  /* Window state changes (fullscreen, maximize, etc.) may resize the
+     frame or invalidate compositor-side content.  Mark as garbaged so
+     Emacs redisplay redraws.  Do NOT queue a GtkGLArea render here —
+     redisplay hasn't run yet, so the render callback would blit
+     stale content.  pgtk_frame_up_to_date will queue the render
+     after content has been drawn.  */
   if (FRAME_GL_AREA (f))
-    {
-      gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
-      SET_FRAME_GARBAGED (f);
-    }
+    SET_FRAME_GARBAGED (f);
 #endif
 
   if (inev.ie.kind != NO_EVENT)
@@ -9443,17 +9441,13 @@ pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
 
       /* The surface will be recreated on next draw in
-	 pgtk_begin_skia_clip. Mark frame as garbaged to trigger a
-	 full redraw.  */
-
-      /* Mark the frame as needing a full redraw.  */
+	 pgtk_begin_skia_clip.  Mark frame as garbaged to trigger a
+	 full redraw.  Do NOT queue a GtkGLArea render here — Emacs
+	 redisplay hasn't drawn content yet, so the render callback
+	 would blit an empty surface.  Instead, let redisplay run
+	 first; pgtk_frame_up_to_date will queue the render after
+	 content has been drawn.  */
       SET_FRAME_GARBAGED (f);
-
-      /* Queue a render to ensure the GtkGLArea redraws after resize.
-	 This is needed because SET_FRAME_GARBAGED only marks the
-	 frame for Emacs redisplay but doesn't trigger a GtkGLArea
-	 render.  */
-      gtk_gl_area_queue_render (gl_area);
     }
 }
 
