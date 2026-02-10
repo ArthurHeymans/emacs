@@ -451,6 +451,10 @@ struct pgtk_output
      GL context corruption and trigger recovery (full GL teardown and
      rebuild).  Reset to 0 on each successful render.  */
   int gl_timeout_count;
+  /* Whether the GtkGLArea has been shown.  We defer showing it until
+     after the first successful Emacs redisplay so that GTK's automatic
+     first render doesn't composite an empty/transparent FBO.  */
+  bool gl_area_shown;
 #endif
   struct atimer *atimer_visible_bell;
 
