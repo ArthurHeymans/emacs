@@ -9189,69 +9189,18 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 
-      /* Use non-blocking fence sync with timeout instead of
-	 glFinish() to prevent indefinite blocking that can freeze
-	 keyboard input. 200ms timeout is enough for most GPU
-	 operations while preventing hangs from corrupted GL state. */
-      bool gpu_ready = pgtk_gl_finish_with_timeout ("render_flush");
+      /* Re-attach GtkGLArea's buffers after Skia flush.  Skia's
+	 flushAndSubmit() binds our FBO internally, so we need to
+	 restore GtkGLArea's framebuffer as the draw target for the
+	 blit.
 
-      if (!gpu_ready)
-	{
-	  FRAME_GL_TIMEOUT_COUNT (f)++;
-
-	  /* GPU didn't finish in time.  Do NOT blit potentially
-	     incomplete/corrupt FBO content — that leads to a
-	     transparent frame.  Instead, clear to background and
-	     request a full redraw.  This lets Emacs recover from
-	     transient GPU stalls without getting stuck.  */
-	  unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-	  float r = RED_FROM_ULONG (bg) / 255.0f;
-	  float g = GREEN_FROM_ULONG (bg) / 255.0f;
-	  float b = BLUE_FROM_ULONG (bg) / 255.0f;
-	  float a = (float) f->alpha_background;
-	  glClearColor (r, g, b, a);
-	  glClear (GL_COLOR_BUFFER_BIT);
-
-	  if (FRAME_GL_TIMEOUT_COUNT (f) >= 3)
-	    {
-	      /* Multiple consecutive timeouts indicate persistent GL
-		 context corruption.  Destroy the Skia surface to
-		 force a complete rebuild on the next draw.  The GL
-		 context and FBO are preserved — only the Skia wrapper
-		 is rebuilt, which forces Skia to re-query all GL
-		 state.  */
-	      fprintf (stderr,
-		       "Skia: %d consecutive GPU timeouts - "
-		       "forcing Skia surface rebuild\n",
-		       FRAME_GL_TIMEOUT_COUNT (f));
-	      if (FRAME_SKIA_SURFACE (f))
-		{
-		  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
-		  FRAME_SKIA_SURFACE (f) = NULL;
-		  FRAME_SKIA_CANVAS (f) = NULL;
-		}
-	      if (FRAME_SKIA_GL_CONTEXT (f))
-		emacs_skia_gl_context_reset (
-		  FRAME_SKIA_GL_CONTEXT (f));
-	      FRAME_GL_TIMEOUT_COUNT (f) = 0;
-	    }
-
-	  /* Flush to ensure the clear reaches the GPU before GTK
-	     presents this buffer to the compositor.  */
-	  glFlush ();
-
-	  /* Force a complete redraw so content is regenerated.  */
-	  SET_FRAME_GARBAGED (f);
-	  gtk_gl_area_queue_render (gl_area);
-	  return TRUE;
-	}
-
-      /* GPU completed successfully — reset timeout counter.  */
-      FRAME_GL_TIMEOUT_COUNT (f) = 0;
-
-      /* Re-attach GtkGLArea's buffers after Skia flush.  Skia's flush
-	 operation binds our FBO internally, so we need to restore
-	 GtkGLArea's framebuffer as the draw target for the blit.  */
+	 No fence or glFinish is needed here: Skia's flushAndSubmit()
+	 submits all pending GL commands on the current context, and
+	 the subsequent glBlitFramebuffer runs on the same context.
+	 GL guarantees in-order execution within a single context, so
+	 the blit will always see the completed Skia output.  A fence
+	 would be necessary only if Skia used a separate GL context
+	 (it does not — GrDirectContext wraps the active context).  */
       gtk_gl_area_attach_buffers (gl_area);
     }
   else
@@ -9293,27 +9242,6 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   int dst_width = gl_alloc.width * scale;
   int dst_height = gl_alloc.height * scale;
 
-  /* If the Skia surface dimensions don't match the GtkGLArea
-     allocation, the surface is stale (from before a resize).
-     Blitting mismatched dimensions produces visually wrong output
-     (e.g. content appears upside-down or distorted) because the FBO
-     content was rendered at the old size.  Clear to background and
-     request a redraw instead.  */
-  if (src_width != dst_width || src_height != dst_height)
-    {
-      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-      float r = RED_FROM_ULONG (bg) / 255.0f;
-      float g = GREEN_FROM_ULONG (bg) / 255.0f;
-      float b = BLUE_FROM_ULONG (bg) / 255.0f;
-      float a = (float) f->alpha_background;
-      glClearColor (r, g, b, a);
-      glClear (GL_COLOR_BUFFER_BIT);
-      glFlush ();
-      SET_FRAME_GARBAGED (f);
-      gtk_gl_area_queue_render (gl_area);
-      return TRUE;
-    }
-
   /* Set the viewport explicitly to ensure correct rendering for child
      frames that share their parent's GL context.  */
   glViewport (0, 0, dst_width, dst_height);
@@ -9333,16 +9261,9 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
 		     dst_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
   /* Flush to ensure the blit is submitted to the GPU before this
-     callback returns.  Without this, the blit is merely queued in
-     the GL command pipeline and may not have completed when GTK
-     reads the GtkGLArea's FBO to composite it into the Wayland
-     surface.  This causes a race condition where the compositor
-     sees the stale (transparent) FBO content from a previous
-     NULL-surface clear, resulting in a permanently transparent
-     frame.  This is especially likely during rapid resize at
-     startup, when multiple NULL-surface clears leave transparent
-     content in the GtkGLArea buffer and the first real blit races
-     with GTK's presentation.  */
+     callback returns.  GTK reads the GtkGLArea FBO immediately
+     after to composite it into the Wayland surface; without the
+     flush, the compositor may see stale (transparent) content.  */
   glFlush ();
 
   /* Restore framebuffer bindings.  */
