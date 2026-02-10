@@ -9293,6 +9293,27 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   int dst_width = gl_alloc.width * scale;
   int dst_height = gl_alloc.height * scale;
 
+  /* If the Skia surface dimensions don't match the GtkGLArea
+     allocation, the surface is stale (from before a resize).
+     Blitting mismatched dimensions produces visually wrong output
+     (e.g. content appears upside-down or distorted) because the FBO
+     content was rendered at the old size.  Clear to background and
+     request a redraw instead.  */
+  if (src_width != dst_width || src_height != dst_height)
+    {
+      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
+      float r = RED_FROM_ULONG (bg) / 255.0f;
+      float g = GREEN_FROM_ULONG (bg) / 255.0f;
+      float b = BLUE_FROM_ULONG (bg) / 255.0f;
+      float a = (float) f->alpha_background;
+      glClearColor (r, g, b, a);
+      glClear (GL_COLOR_BUFFER_BIT);
+      glFlush ();
+      SET_FRAME_GARBAGED (f);
+      gtk_gl_area_queue_render (gl_area);
+      return TRUE;
+    }
+
   /* Set the viewport explicitly to ensure correct rendering for child
      frames that share their parent's GL context.  */
   glViewport (0, 0, dst_width, dst_height);
