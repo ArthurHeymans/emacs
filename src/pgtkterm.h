@@ -451,6 +451,11 @@ struct pgtk_output
      GL context corruption and trigger recovery (full GL teardown and
      rebuild).  Reset to 0 on each successful render.  */
   int gl_timeout_count;
+  /* Count consecutive GL surface creation failures.  After
+     SKIA_MAX_SURFACE_CREATION_FAILURES consecutive failures, we stop
+     attempting surface creation to avoid flooding stderr.  Reset to 0
+     on successful creation or GL context re-realize.  */
+  int gl_surface_creation_failures;
   /* Whether the GtkGLArea has been shown.  We defer showing it until
      after the first successful Emacs redisplay so that GTK's automatic
      first render doesn't composite an empty/transparent FBO.  */
@@ -587,6 +592,12 @@ enum
 # define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
 # define FRAME_SKIA_GL_STATE_DIRTY(f) ((f)->output_data.pgtk->skia_gl_state_dirty)
 # define FRAME_GL_TIMEOUT_COUNT(f) ((f)->output_data.pgtk->gl_timeout_count)
+# define FRAME_GL_SURFACE_CREATION_FAILURES(f) \
+    ((f)->output_data.pgtk->gl_surface_creation_failures)
+/* Stop attempting GL surface creation after this many consecutive
+   failures.  Prevents flooding stderr with identical error messages
+   when the GL context is permanently broken.  */
+# define SKIA_MAX_SURFACE_CREATION_FAILURES 3
 #endif
 
 

@@ -4923,8 +4923,14 @@ pgtk_flash (struct frame *f)
 
   block_input ();
 
-  width = FRAME_CR_SURFACE_DESIRED_WIDTH (f);
-  height = FRAME_CR_SURFACE_DESIRED_HEIGHT (f);
+  width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
+  height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+
+  if (width <= 0 || height <= 0)
+    {
+      unblock_input ();
+      return;
+    }
 
   /* Create a new surface for the flash effect */
   surface = emacs_skia_surface_create_raster (width, height);
@@ -8298,11 +8304,30 @@ pgtk_set_event_handler (struct frame *f)
     /* Request OpenGL 3.2 core profile for Skia compatibility.  */
     gtk_gl_area_set_required_version (GTK_GL_AREA (gl_area), 3, 2);
     gtk_gl_area_set_has_depth_buffer (GTK_GL_AREA (gl_area), FALSE);
-    /* Skia needs stencil buffer for clip mask operations.  */
-    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), TRUE);
+    /* We manage our own stencil buffer on the offscreen FBO that Skia
+       renders into.  GtkGLArea's stencil is not needed since we only
+       use its FBO as a blit target.  */
+    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), FALSE);
     gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
-    /* Enable alpha channel for frame transparency support.  */
-    gtk_gl_area_set_has_alpha (GTK_GL_AREA (gl_area), TRUE);
+    /* CRITICAL: Do NOT set has_alpha to TRUE.  With has_alpha=TRUE,
+       GTK3 uses a GL_TEXTURE_2D for the internal FBO color attachment
+       and gdk_cairo_draw_from_gl takes the alpha-compositing path
+       (gdkgl.c:526-656), which uploads the existing window background
+       to a texture, enables GL_BLEND, and draws our content on top.
+       This is extremely fragile: any pixel with alpha < 1.0 gets
+       blended with potentially uninitialized window background, and
+       the whole process trashes GL state (shaders, VAOs, textures).
+
+       With has_alpha=FALSE, GtkGLArea uses a GL_RENDERBUFFER (RGB8)
+       and gdk_cairo_draw_from_gl takes the simpler direct-blit path
+       (gdkgl.c:423-524) which uses glBlitFramebuffer with no alpha
+       compositing.  Our offscreen FBO content (with alpha=1.0 for
+       normal backgrounds) is blitted directly.
+
+       If frame transparency (alpha-background) is needed, it should
+       be handled at the compositor level, not through GtkGLArea's
+       alpha channel.  */
+    gtk_gl_area_set_has_alpha (GTK_GL_AREA (gl_area), FALSE);
 
     /* Connect GtkGLArea signals.  */
     g_signal_connect (G_OBJECT (gl_area), "realize",
@@ -9093,6 +9118,7 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
   FRAME_SKIA_GL_INITIALIZED (f) = false;
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
   FRAME_GL_TIMEOUT_COUNT (f) = 0;
+  FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   /* Mark frame as garbaged so it gets redrawn when realized again. */
   SET_FRAME_GARBAGED (f);
@@ -9149,6 +9175,7 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
   FRAME_GL_TIMEOUT_COUNT (f) = 0;
+  FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
 
@@ -9568,6 +9595,7 @@ pgtk_init_gl_area (struct frame *f)
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
   FRAME_GL_TIMEOUT_COUNT (f) = 0;
+  FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
   /* No GtkGLArea - we use direct GdkGLContext.  */
@@ -9816,6 +9844,14 @@ pgtk_begin_skia_clip (struct frame *f)
       if (height <= 0)
 	height = 1;
 
+      /* If we've exceeded the maximum number of consecutive surface
+	 creation failures, don't attempt again.  The counter is reset
+	 when the GL context is re-realized (pgtk_gl_area_realize) or
+	 when the surface is successfully created.  */
+      if (FRAME_GL_SURFACE_CREATION_FAILURES (f)
+	  >= SKIA_MAX_SURFACE_CREATION_FAILURES)
+	return NULL;
+
       /* Use GtkGLArea's context if available.  */
       if (FRAME_GL_AREA (f) && FRAME_GDK_GL_CONTEXT (f))
 	{
@@ -9877,6 +9913,17 @@ pgtk_begin_skia_clip (struct frame *f)
 	  /* Create Skia surface if needed.  */
 	  if (!FRAME_SKIA_SURFACE (f) && FRAME_GL_FRAMEBUFFER (f))
 	    {
+	      /* Reset Skia's cached GL state before creating a new
+		 surface.  The preceding pgtk_ensure_gl_framebuffer or
+		 pgtk_resize_fbo_preserve_content may have modified GL
+		 state (bound textures, FBOs, renderbuffers) that Skia's
+		 GrDirectContext has cached.  Without this reset, Skia
+		 may wrap the FBO with stale assumptions about GL state,
+		 leading to rendering into wrong targets or failing
+		 surface creation.  */
+	      if (FRAME_SKIA_GL_CONTEXT (f))
+		emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+
 	      FRAME_SKIA_SURFACE (f) = emacs_skia_surface_create_gl (
 		FRAME_SKIA_GL_CONTEXT (f), width, height,
 		FRAME_GL_FRAMEBUFFER (f), GL_RGBA8);
@@ -9901,6 +9948,10 @@ pgtk_begin_skia_clip (struct frame *f)
 	  while (glGetError () != GL_NO_ERROR)
 	    ;
 
+	  /* Reset Skia's cached GL state before surface creation.  */
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+
 	  FRAME_SKIA_SURFACE (f)
 	    = emacs_skia_surface_create_gl (FRAME_SKIA_GL_CONTEXT (f),
 					    width, height,
@@ -9918,13 +9969,26 @@ pgtk_begin_skia_clip (struct frame *f)
 
       if (!FRAME_SKIA_SURFACE (f))
 	{
-	  /* Surface creation failed.  This could be due to GL context
-	     issues.  Log the failure for debugging.  */
-	  fprintf (stderr,
-		   "Skia: No surface available for frame %p\n",
-		   (void *) f);
+	  FRAME_GL_SURFACE_CREATION_FAILURES (f)++;
+	  if (FRAME_GL_SURFACE_CREATION_FAILURES (f)
+	      >= SKIA_MAX_SURFACE_CREATION_FAILURES)
+	    fprintf (stderr,
+		     "Skia: GL surface creation failed %d times for "
+		     "frame %p, giving up (will retry on re-realize)\n",
+		     FRAME_GL_SURFACE_CREATION_FAILURES (f),
+		     (void *) f);
+	  else
+	    fprintf (stderr,
+		     "Skia: No surface available for frame %p "
+		     "(attempt %d/%d)\n",
+		     (void *) f,
+		     FRAME_GL_SURFACE_CREATION_FAILURES (f),
+		     SKIA_MAX_SURFACE_CREATION_FAILURES);
 	  return NULL;
 	}
+
+      /* Surface creation succeeded — reset the failure counter.  */
+      FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
       canvas = emacs_skia_surface_get_canvas (FRAME_SKIA_SURFACE (f));
       if (!canvas)
