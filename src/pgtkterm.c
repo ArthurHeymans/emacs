@@ -4327,9 +4327,8 @@ pgtk_frame_up_to_date (struct frame *f)
 	     synchronization.  Previously this just returned, which
 	     could cause visual freezes if no more
 	     pgtk_frame_up_to_date calls occurred.  */
-	  if (FRAME_GL_AREA (f))
-	    gtk_gl_area_queue_render (
-	      GTK_GL_AREA (FRAME_GL_AREA (f)));
+	  if (FRAME_GL_DRAWING_AREA (f))
+	    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
 	  unblock_input ();
 	  return;
 	}
@@ -4342,9 +4341,9 @@ pgtk_frame_up_to_date (struct frame *f)
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 
-      /* Queue a render on the GtkGLArea.  */
-      if (FRAME_GL_AREA (f))
-	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      /* Queue a draw on the drawing area.  */
+      if (FRAME_GL_DRAWING_AREA (f))
+	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
       unblock_input ();
       return;
     }
@@ -4824,8 +4823,8 @@ pgtk_flush_display (struct frame *f)
     }
 
   /* Queue a render to display the completed content.  */
-  if (FRAME_GL_AREA (f))
-    gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+  if (FRAME_GL_DRAWING_AREA (f))
+    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
 #endif
 }
 
@@ -4887,9 +4886,9 @@ recover_from_visible_bell (struct atimer *timer)
       emacs_skia_surface_destroy (
 	FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
       FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
-      /* Queue a re-render so GtkGLArea repaints without the bell.  */
-      if (FRAME_GL_AREA (f))
-	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      /* Queue a re-draw so the drawing area repaints without the bell.  */
+      if (FRAME_GL_DRAWING_AREA (f))
+	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
     }
 #else
   if (FRAME_X_OUTPUT (f)->cr_surface_visible_bell != NULL)
@@ -6107,15 +6106,15 @@ pgtk_buffer_flipping_unblocked_hook (struct frame *f)
 {
   block_input ();
 #ifdef USE_SKIA
-  /* For Skia GL, queue a render on the GtkGLArea.  */
+  /* For Skia GL, queue a draw on the drawing area.  */
   if (FRAME_SKIA_SURFACE (f))
     {
       /* Flush Skia first.  */
       emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-      if (FRAME_GL_AREA (f))
-	gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+      if (FRAME_GL_DRAWING_AREA (f))
+	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
     }
   else
 #endif
@@ -6387,9 +6386,9 @@ pgtk_handle_draw (GtkWidget *widget, cairo_t *cr, gpointer *data)
     return FALSE;
 
 #ifdef USE_SKIA
-  /* For Skia with GL rendering, GtkGLArea handles all display via its
-     render callback.  This draw callback on the GtkFixed widget is
-     not used.  Return FALSE to indicate we didn't handle the draw. */
+  /* For Skia with GL rendering, the GtkDrawingArea handles display
+     via its own draw callback (pgtk_gl_drawing_area_draw).  This draw
+     callback on the GtkFixed widget is not used.  */
   (void) cr; /* Suppress unused parameter warning.  */
   return FALSE;
 #else /* USE_CAIRO */
@@ -6420,36 +6419,23 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
     {
       xg_frame_resized (f, alloc->width, alloc->height);
 #ifdef USE_SKIA
-      /* Resize the GtkGLArea to fill the frame.  GtkFixed doesn't
+      /* Resize the drawing area to fill the frame.  GtkFixed doesn't
 	 automatically re-allocate children when their size request
-	 changes, so we must explicitly allocate the GtkGLArea.  This
-	 triggers its "resize" signal, which handles all GL resource
-	 updates (FBO resize, surface destruction, etc.).
-
-	 IMPORTANT: Do NOT call pgtk_skia_update_surface_desired_size
-	 here.  That would destroy the Skia surface with glFinish()
-	 before the GtkGLArea resize callback runs, creating a race
-	 condition: the resize callback would find the surface already
-	 NULL and the GL context may be in an inconsistent state.
-	 Instead, just update the desired dimensions and let
-	 pgtk_gl_area_resize handle the actual GL work.  */
-      if (FRAME_GL_AREA (f))
+	 changes, so we must explicitly allocate the drawing area.  This
+	 triggers a redraw.  We resize the drawing area and update
+	 the desired dimensions; pgtk_begin_skia_clip handles the
+	 actual FBO resize on next draw.  */
+      if (FRAME_GL_DRAWING_AREA (f))
 	{
 	  GtkAllocation gl_alloc;
 	  gl_alloc.x = 0;
 	  gl_alloc.y = 0;
 	  gl_alloc.width = alloc->width;
 	  gl_alloc.height = alloc->height;
-	  /* Record the desired size so pgtk_begin_skia_clip knows the
-	     target dimensions.  Do NOT destroy the surface here.  */
-	  FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = alloc->width;
-	  FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = alloc->height;
-	  gtk_widget_size_allocate (FRAME_GL_AREA (f), &gl_alloc);
+	  gtk_widget_size_allocate (FRAME_GL_DRAWING_AREA (f), &gl_alloc);
 	}
-      else
-	/* Fallback path without GtkGLArea.  */
-	pgtk_skia_update_surface_desired_size (f, alloc->width,
-					       alloc->height, false);
+      pgtk_skia_update_surface_desired_size (f, alloc->width,
+					     alloc->height, false);
 #else
       pgtk_cr_update_surface_desired_size (f, alloc->width,
 					   alloc->height, false);
@@ -6937,11 +6923,11 @@ map_event (GtkWidget *widget, GdkEvent *event, gpointer *user_data)
 #ifdef USE_SKIA
       /* Wayland compositors may discard surface content when windows
 	 are unmapped.  Mark as garbaged so Emacs redisplay redraws
-	 the content.  Do NOT queue a GtkGLArea render here — redisplay
+	 the content.  Do NOT queue a draw here — redisplay
 	 hasn't run yet, so the render callback would blit a stale or
 	 empty surface.  pgtk_frame_up_to_date will queue the render
 	 after content has been drawn.  */
-      if (FRAME_GL_AREA (f))
+      if (FRAME_GL_DRAWING_AREA (f))
 	SET_FRAME_GARBAGED (f);
 #endif
 
@@ -7030,11 +7016,11 @@ window_state_event (GtkWidget *widget, GdkEvent *event,
 #ifdef USE_SKIA
   /* Window state changes (fullscreen, maximize, etc.) may resize the
      frame or invalidate compositor-side content.  Mark as garbaged so
-     Emacs redisplay redraws.  Do NOT queue a GtkGLArea render here —
+     Emacs redisplay redraws.  Do NOT queue a draw here —
      redisplay hasn't run yet, so the render callback would blit
      stale content.  pgtk_frame_up_to_date will queue the render
      after content has been drawn.  */
-  if (FRAME_GL_AREA (f))
+  if (FRAME_GL_DRAWING_AREA (f))
     SET_FRAME_GARBAGED (f);
 #endif
 
@@ -7223,11 +7209,11 @@ focus_in_event (GtkWidget *widget, GdkEvent *event,
   /* Force a complete redraw when focus is regained.  Wayland
      compositors may discard or invalidate surface content when
      windows are unfocused or their state changes.  Do NOT queue
-     a GtkGLArea render here — redisplay hasn't run yet, so the
+     a draw here — redisplay hasn't run yet, so the
      render callback would blit stale content or hit the NULL-surface
      path.  SET_FRAME_GARBAGED triggers redisplay, and
      pgtk_frame_up_to_date queues the render after content is drawn.  */
-  if (FRAME_GL_AREA (frame))
+  if (FRAME_GL_DRAWING_AREA (frame))
     SET_FRAME_GARBAGED (frame);
 #endif
 
@@ -8213,16 +8199,13 @@ static gboolean pgtk_selection_event (GtkWidget *, GdkEvent *,
 				      gpointer);
 
 #ifdef USE_SKIA
-/* Forward declarations for GtkGLArea callbacks.  */
-static void pgtk_gl_area_realize (GtkGLArea *, gpointer);
-static void pgtk_gl_area_unrealize (GtkGLArea *, gpointer);
-static gboolean pgtk_gl_area_render (GtkGLArea *, GdkGLContext *,
-				     gpointer);
-static void pgtk_gl_area_resize (GtkGLArea *, gint, gint, gpointer);
+/* Forward declarations for Skia GL drawing area callbacks.  */
+static void pgtk_gl_drawing_area_realize (GtkWidget *, gpointer);
+static void pgtk_gl_drawing_area_unrealize (GtkWidget *, gpointer);
+static gboolean pgtk_gl_drawing_area_draw (GtkWidget *, cairo_t *,
+					   gpointer);
 static bool pgtk_setup_gl_framebuffer (struct frame *, int, int);
 static bool pgtk_check_gl_error (const char *);
-static bool pgtk_create_blit_shader (struct frame *);
-static void pgtk_destroy_blit_shader (struct frame *);
 #endif
 
 void
@@ -8298,70 +8281,44 @@ pgtk_set_event_handler (struct frame *f)
 		    G_CALLBACK (drag_drop), NULL);
 
 #ifdef USE_SKIA
-  /* For Skia GL rendering, create a GtkGLArea widget.  */
+  /* For Skia GL rendering, create a GtkDrawingArea and manage our own
+     GdkGLContext.  We call gdk_cairo_draw_from_gl directly in the
+     draw callback, handing it our FBO texture.  This eliminates the
+     extra FBO copy that GtkGLArea's internal FBO would require:
+     Skia renders into our single FBO, and gdk_cairo_draw_from_gl
+     composites that texture directly to the window back buffer.
+
+     gdk_cairo_draw_from_gl's texture compositing path (gdkgl.c:526-656)
+     trashes GL state (shaders, VAOs, textures, blend).  This is safe
+     because pgtk_begin_skia_clip calls emacs_skia_gl_context_reset
+     (GrDirectContext::resetContext(kAll)) before every Skia draw.  */
   {
-    GtkWidget *gl_area = gtk_gl_area_new ();
-    FRAME_GL_AREA (f) = gl_area;
+    GtkWidget *drawing_area = gtk_drawing_area_new ();
+    FRAME_GL_DRAWING_AREA (f) = drawing_area;
 
-    /* Request OpenGL 3.2 core profile for Skia compatibility.  */
-    gtk_gl_area_set_required_version (GTK_GL_AREA (gl_area), 3, 2);
-    gtk_gl_area_set_has_depth_buffer (GTK_GL_AREA (gl_area), FALSE);
-    /* We manage our own stencil buffer on the offscreen FBO that Skia
-       renders into.  GtkGLArea's stencil is not needed since we only
-       use its FBO as a blit target.  */
-    gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), FALSE);
-    gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
-    /* Enable has_alpha so GtkGLArea's internal FBO is RGBA8 and the
-       compositor can see per-pixel alpha for frame transparency
-       (alpha-background).
+    /* Connect signals.  The GL context is created in realize (once the
+       GdkWindow exists), and the draw callback composites via
+       gdk_cairo_draw_from_gl.  */
+    g_signal_connect (G_OBJECT (drawing_area), "realize",
+		      G_CALLBACK (pgtk_gl_drawing_area_realize), f);
+    g_signal_connect (G_OBJECT (drawing_area), "unrealize",
+		      G_CALLBACK (pgtk_gl_drawing_area_unrealize), f);
+    g_signal_connect (G_OBJECT (drawing_area), "draw",
+		      G_CALLBACK (pgtk_gl_drawing_area_draw), f);
 
-       With has_alpha=TRUE, GTK3 uses a GL_TEXTURE_2D for the internal
-       FBO and gdk_cairo_draw_from_gl takes the alpha-compositing path
-       (gdkgl.c:526-656), which trashes GL state (shaders, VAOs,
-       textures).  This is safe because:
-       1. We use a shader-based blit (not glBlitFramebuffer) to copy
-          our RGBA FBO into GtkGLArea's RGBA FBO, preserving alpha.
-       2. The GL state trashing happens AFTER our render callback
-          returns, between frames.
-       3. pgtk_begin_skia_clip() calls emacs_skia_gl_context_reset()
-          (GrDirectContext::resetContext(kAll)) before every Skia draw,
-          which fully recovers all trashed GL state.
-       4. The startup transparent-frame bug is prevented by the eager
-          FBO clear in pgtk_gl_area_realize() which writes alpha=1.0
-          (fully opaque) before the first render.  */
-    gtk_gl_area_set_has_alpha (GTK_GL_AREA (gl_area), TRUE);
+    /* CRITICAL: Make drawing area non-focusable so that keyboard
+       focus stays on FRAME_GTK_WIDGET where the key-press-event
+       handler is connected.  */
+    gtk_widget_set_can_focus (drawing_area, FALSE);
 
-    /* Connect GtkGLArea signals.  */
-    g_signal_connect (G_OBJECT (gl_area), "realize",
-		      G_CALLBACK (pgtk_gl_area_realize), f);
-    g_signal_connect (G_OBJECT (gl_area), "unrealize",
-		      G_CALLBACK (pgtk_gl_area_unrealize), f);
-    g_signal_connect (G_OBJECT (gl_area), "render",
-		      G_CALLBACK (pgtk_gl_area_render), f);
-    g_signal_connect (G_OBJECT (gl_area), "resize",
-		      G_CALLBACK (pgtk_gl_area_resize), f);
+    /* Add to the GtkFixed at position (0,0).  */
+    gtk_fixed_put (GTK_FIXED (FRAME_GTK_WIDGET (f)), drawing_area, 0, 0);
 
-    /* CRITICAL: Make GtkGLArea non-focusable so that keyboard focus
-       stays on FRAME_GTK_WIDGET where the key-press-event handler is
-       connected.  Without this, clicking on the GL area can steal
-       focus and keyboard events stop being delivered to Emacs.  */
-    gtk_widget_set_can_focus (gl_area, FALSE);
-
-    /* Add GtkGLArea to the GtkFixed at position (0,0).  */
-    gtk_fixed_put (GTK_FIXED (FRAME_GTK_WIDGET (f)), gl_area, 0, 0);
-
-    /* Make it fill the entire frame.  This will be updated on resize.
-     */
-    gtk_widget_set_size_request (gl_area, 1, 1);
-    gtk_widget_set_hexpand (gl_area, TRUE);
-    gtk_widget_set_vexpand (gl_area, TRUE);
-    /* Show the GtkGLArea.  GTK will fire a "render" signal when
-       the widget first becomes visible, before Emacs redisplay has
-       drawn any content.  The eager surface creation in
-       pgtk_gl_area_realize ensures the FBO has valid opaque content
-       for that initial render, preventing transparent/white flash.  */
-    gtk_widget_show (gl_area);
-    FRAME_X_OUTPUT (f)->gl_area_shown = true;
+    /* Make it fill the entire frame.  Updated on resize.  */
+    gtk_widget_set_size_request (drawing_area, 1, 1);
+    gtk_widget_set_hexpand (drawing_area, TRUE);
+    gtk_widget_set_vexpand (drawing_area, TRUE);
+    gtk_widget_show (drawing_area);
   }
 #else
   /* For Cairo, use the draw callback.  */
@@ -9059,163 +9016,23 @@ pgtk_gl_finish_with_timeout (const char *context)
     }
 }
 
-/* Shader source for alpha-aware FBO-to-screen blit.
-
-   Instead of glBlitFramebuffer (which requires matching FBO formats
-   and discards alpha when the target is RGB8), we draw a fullscreen
-   triangle that samples the offscreen RGBA FBO texture.  This
-   preserves per-pixel alpha so GtkGLArea (with has_alpha=TRUE) can
-   hand correct alpha to the compositor for frame transparency.
-
-   The vertex shader generates a fullscreen triangle from gl_VertexID
-   alone (no vertex buffer needed).  The fragment shader is a trivial
-   texture passthrough.  */
-static const char *blit_vertex_shader_src =
-  "#version 150\n"
-  "out vec2 v_uv;\n"
-  "void main () {\n"
-  "  /* Generate a triangle that covers [-1,1]x[-1,1]:\n"
-  "     id=0 -> (-1,-1), id=1 -> (3,-1), id=2 -> (-1,3) */\n"
-  "  float x = float ((gl_VertexID << 1) & 2) * 2.0 - 1.0;\n"
-  "  float y = float (gl_VertexID & 2) * 2.0 - 1.0;\n"
-  "  v_uv = vec2 ((x + 1.0) * 0.5, (y + 1.0) * 0.5);\n"
-  "  gl_Position = vec4 (x, y, 0.0, 1.0);\n"
-  "}\n";
-
-static const char *blit_fragment_shader_src =
-  "#version 150\n"
-  "in vec2 v_uv;\n"
-  "out vec4 frag_color;\n"
-  "uniform sampler2D u_texture;\n"
-  "void main () {\n"
-  "  frag_color = texture (u_texture, v_uv);\n"
-  "}\n";
-
-/* Compile a single shader.  Returns the shader ID, or 0 on failure.  */
-static GLuint
-pgtk_compile_shader (GLenum type, const char *source)
-{
-  GLuint shader = glCreateShader (type);
-  if (!shader)
-    return 0;
-
-  glShaderSource (shader, 1, &source, NULL);
-  glCompileShader (shader);
-
-  GLint status = 0;
-  glGetShaderiv (shader, GL_COMPILE_STATUS, &status);
-  if (!status)
-    {
-      char log[512];
-      glGetShaderInfoLog (shader, sizeof log, NULL, log);
-      fprintf (stderr, "Skia: shader compile error: %s\n", log);
-      glDeleteShader (shader);
-      return 0;
-    }
-  return shader;
-}
-
-/* Create the blit shader program, VAO, and uniform locations for a
-   frame.  Called from pgtk_gl_area_realize after the GL context is
-   ready.  Returns true on success.  */
-static bool
-pgtk_create_blit_shader (struct frame *f)
-{
-  GLuint vs = pgtk_compile_shader (GL_VERTEX_SHADER,
-				   blit_vertex_shader_src);
-  if (!vs)
-    return false;
-
-  GLuint fs = pgtk_compile_shader (GL_FRAGMENT_SHADER,
-				   blit_fragment_shader_src);
-  if (!fs)
-    {
-      glDeleteShader (vs);
-      return false;
-    }
-
-  GLuint program = glCreateProgram ();
-  if (!program)
-    {
-      glDeleteShader (vs);
-      glDeleteShader (fs);
-      return false;
-    }
-  glAttachShader (program, vs);
-  glAttachShader (program, fs);
-  glLinkProgram (program);
-
-  /* Shaders can be detached/deleted after linking.  */
-  glDetachShader (program, vs);
-  glDetachShader (program, fs);
-  glDeleteShader (vs);
-  glDeleteShader (fs);
-
-  GLint status = 0;
-  glGetProgramiv (program, GL_LINK_STATUS, &status);
-  if (!status)
-    {
-      char log[512];
-      glGetProgramInfoLog (program, sizeof log, NULL, log);
-      fprintf (stderr, "Skia: blit program link error: %s\n", log);
-      glDeleteProgram (program);
-      return false;
-    }
-
-  GLint tex_loc = glGetUniformLocation (program, "u_texture");
-
-  /* Core profile requires a VAO to be bound for any draw call.
-     We use an empty VAO since the vertex shader generates positions
-     from gl_VertexID.  */
-  GLuint vao = 0;
-  glGenVertexArrays (1, &vao);
-
-  FRAME_GL_BLIT_PROGRAM (f) = program;
-  FRAME_GL_BLIT_VAO (f) = vao;
-  FRAME_GL_BLIT_TEX_UNIFORM (f) = tex_loc;
-
-  return true;
-}
-
-/* Destroy the blit shader resources.  Called from
-   pgtk_gl_area_unrealize.  */
+/* Drawing area "unrealize" callback - clean up GL resources when
+   the widget's GdkWindow is about to be destroyed.  */
 static void
-pgtk_destroy_blit_shader (struct frame *f)
-{
-  if (FRAME_GL_BLIT_PROGRAM (f))
-    {
-      glDeleteProgram (FRAME_GL_BLIT_PROGRAM (f));
-      FRAME_GL_BLIT_PROGRAM (f) = 0;
-    }
-  if (FRAME_GL_BLIT_VAO (f))
-    {
-      glDeleteVertexArrays (1, &FRAME_GL_BLIT_VAO (f));
-      FRAME_GL_BLIT_VAO (f) = 0;
-    }
-  FRAME_GL_BLIT_TEX_UNIFORM (f) = -1;
-}
-
-/* GtkGLArea "unrealize" callback - clean up GL resources when context
-   is lost. This is critical for handling display sleep, window
-   manager changes, or driver issues that invalidate the GL context.
- */
-static void
-pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
+pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
 
-  /* The GL context is about to be destroyed.  We must clean up all
-     Skia resources that depend on it before this happens.  */
+  if (!FRAME_GDK_GL_CONTEXT (f))
+    return;
+
+  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
   /* Flush all pending GPU operations before destroying resources.  */
   if (FRAME_SKIA_SURFACE (f))
     emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
   if (FRAME_SKIA_GL_CONTEXT (f))
     emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-
-  /* Destroy the blit shader (GL resources, must be before context
-     destruction).  */
-  pgtk_destroy_blit_shader (f);
 
   /* Destroy Skia surface first (it references the GL context).  */
   if (FRAME_SKIA_SURFACE (f))
@@ -9247,14 +9064,27 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
       FRAME_SKIA_GL_CONTEXT (f) = NULL;
     }
 
-  /* GL resources (FBO, texture, stencil) will be automatically
-     destroyed when the GdkGLContext is destroyed by GTK.  Just clear
-     our references.  */
-  FRAME_GL_FRAMEBUFFER (f) = 0;
-  FRAME_GL_TEXTURE (f) = 0;
-  FRAME_GL_STENCIL (f) = 0;
+  /* Delete GL resources we own.  */
+  if (FRAME_GL_FRAMEBUFFER (f))
+    {
+      glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+      FRAME_GL_FRAMEBUFFER (f) = 0;
+    }
+  if (FRAME_GL_TEXTURE (f))
+    {
+      glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
+      FRAME_GL_TEXTURE (f) = 0;
+    }
+  if (FRAME_GL_STENCIL (f))
+    {
+      glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
+      FRAME_GL_STENCIL (f) = 0;
+    }
 
-  /* The GdkGLContext is owned by GtkGLArea, don't unref it.  */
+  /* We own this context (created via gdk_window_create_gl_context),
+     so unref it.  */
+  gdk_gl_context_clear_current ();
+  g_object_unref (FRAME_GDK_GL_CONTEXT (f));
   FRAME_GDK_GL_CONTEXT (f) = NULL;
 
   FRAME_SKIA_GL_INITIALIZED (f) = false;
@@ -9266,46 +9096,75 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
   SET_FRAME_GARBAGED (f);
 }
 
-/* GtkGLArea "realize" callback - set up GL resources.  */
+/* Drawing area "realize" callback - create GL context and set up
+   resources.  At this point the GdkWindow exists, so we can create
+   a GdkGLContext via gdk_window_create_gl_context (which shares with
+   the window's paint context, required for gdk_cairo_draw_from_gl).  */
 static void
-pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
+pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
+  GdkWindow *gdk_window;
+  GdkGLContext *gl_context;
+  GError *error = NULL;
 
-  /* Make the GtkGLArea's context current.  */
-  gtk_gl_area_make_current (gl_area);
+  if (FRAME_GDK_GL_CONTEXT (f))
+    return; /* Already initialized.  */
 
-  GError *gl_error = gtk_gl_area_get_error (gl_area);
-  if (gl_error != NULL)
+  gdk_window = gtk_widget_get_window (widget);
+  if (!gdk_window)
+    return;
+
+  /* Create a GL context from the GdkWindow.  This context shares
+     objects with the window's internal paint context, so our textures
+     are accessible to gdk_cairo_draw_from_gl.  */
+  gl_context = gdk_window_create_gl_context (gdk_window, &error);
+  if (!gl_context)
     {
-      fprintf (stderr, "Skia: GtkGLArea error on realize: %s\n",
-	       gl_error->message);
+      if (error)
+	{
+	  fprintf (stderr, "Skia: Failed to create GL context: %s\n",
+		   error->message);
+	  g_error_free (error);
+	}
       return;
     }
 
-  /* Clear any pending GL errors from previous context.  */
+  /* Request OpenGL 3.2 for Skia compatibility.  */
+  gdk_gl_context_set_required_version (gl_context, 3, 2);
+
+  if (!gdk_gl_context_realize (gl_context, &error))
+    {
+      if (error)
+	{
+	  fprintf (stderr, "Skia: Failed to realize GL context: %s\n",
+		   error->message);
+	  g_error_free (error);
+	}
+      g_object_unref (gl_context);
+      return;
+    }
+
+  FRAME_GDK_GL_CONTEXT (f) = gl_context;
+  gdk_gl_context_make_current (gl_context);
+
+  /* Clear any pending GL errors.  */
   while (glGetError () != GL_NO_ERROR)
     ;
 
-  /* Log GL version and renderer for debugging compositing issues
-     (e.g. Y-flip bugs on certain Intel drivers).  */
+  /* Log GL version and renderer for debugging compositing issues.  */
   fprintf (stderr, "Skia: GL renderer: %s\n",
 	   (const char *) glGetString (GL_RENDERER));
   fprintf (stderr, "Skia: GL version: %s\n",
 	   (const char *) glGetString (GL_VERSION));
-
-  /* Get the GDK GL context from GtkGLArea.  */
-  GdkGLContext *gl_context = gtk_gl_area_get_context (gl_area);
-  if (!gl_context)
-    return;
-
-  FRAME_GDK_GL_CONTEXT (f) = gl_context;
 
   /* Create Skia GL context using the native GL interface.  */
   FRAME_SKIA_GL_CONTEXT (f) = emacs_skia_gl_context_create_native ();
 
   if (!FRAME_SKIA_GL_CONTEXT (f))
     {
+      gdk_gl_context_clear_current ();
+      g_object_unref (gl_context);
       FRAME_GDK_GL_CONTEXT (f) = NULL;
       return;
     }
@@ -9319,38 +9178,35 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
   FRAME_GL_TIMEOUT_COUNT (f) = 0;
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
-  /* Create the blit shader for alpha-aware FBO-to-screen transfer.
-     This must be done before any rendering so the render callback can
-     use the shader instead of glBlitFramebuffer.  */
-  if (!pgtk_create_blit_shader (f))
-    {
-      fprintf (stderr, "Skia: Failed to create blit shader\n");
-      /* Fall back gracefully — render callback will use
-	 glBlitFramebuffer as a fallback (no alpha support).  */
-    }
-
   FRAME_SKIA_GL_INITIALIZED (f) = true;
 
-  /* Get the initial size and set up the FBO.  */
+  /* Get the initial size and set up the FBO.  On HiDPI displays, the
+     FBO and Skia surface are created at device-pixel resolution
+     (logical pixels * scale factor) for crisp rendering.  The Skia
+     canvas is then scaled so that Emacs's drawing code, which works
+     in logical pixel coordinates, maps correctly to the larger
+     device-pixel surface.  FRAME_SKIA_SURFACE_DESIRED_WIDTH/HEIGHT
+     store logical pixel dimensions; the scale-up happens at FBO
+     creation boundaries.  */
   GtkAllocation alloc;
-  gtk_widget_get_allocation (GTK_WIDGET (gl_area), &alloc);
+  gtk_widget_get_allocation (widget, &alloc);
   if (alloc.width > 0 && alloc.height > 0)
     {
-      pgtk_setup_gl_framebuffer (f, alloc.width, alloc.height);
+      int scale = gtk_widget_get_scale_factor (widget);
+      int dev_width = alloc.width * scale;
+      int dev_height = alloc.height * scale;
+      pgtk_setup_gl_framebuffer (f, dev_width, dev_height);
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = alloc.width;
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = alloc.height;
 
       /* Eagerly create the Skia surface and clear it to the frame's
-	 background color.  This is critical for avoiding the
-	 transparent/white startup race: GtkGLArea will fire its
-	 first "render" signal as soon as the widget becomes visible,
-	 potentially before Emacs redisplay has drawn any content.
-	 By pre-filling the FBO here, that first render will blit a
-	 solid background instead of empty/transparent garbage.  */
+	 background color.  This prevents the first draw callback from
+	 compositing garbage/transparent content before Emacs redisplay
+	 has drawn anything.  */
       if (FRAME_GL_FRAMEBUFFER (f) && FRAME_SKIA_GL_CONTEXT (f))
 	{
 	  FRAME_SKIA_SURFACE (f) = emacs_skia_surface_create_gl (
-	    FRAME_SKIA_GL_CONTEXT (f), alloc.width, alloc.height,
+	    FRAME_SKIA_GL_CONTEXT (f), dev_width, dev_height,
 	    FRAME_GL_FRAMEBUFFER (f), GL_RGBA8);
 	  if (FRAME_SKIA_SURFACE (f))
 	    {
@@ -9359,6 +9215,11 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
 	      if (canvas)
 		{
 		  FRAME_SKIA_CANVAS (f) = canvas;
+		  /* Set HiDPI scale so logical-pixel drawing maps to
+		     the device-pixel surface.  */
+		  if (scale > 1)
+		    emacs_skia_canvas_scale (canvas, (float) scale,
+					    (float) scale);
 		  unsigned long bg
 		    = FRAME_X_OUTPUT (f)->background_color;
 		  Emacs_Color col;
@@ -9367,10 +9228,6 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
 		  uint8_t r = col.red >> 8;
 		  uint8_t g = col.green >> 8;
 		  uint8_t b = col.blue >> 8;
-		  /* Use alpha=255 (fully opaque) regardless of
-		     f->alpha_background.  During this transient state
-		     before the first redisplay, we want the frame to
-		     appear as a solid color, not transparent.  */
 		  emacs_skia_canvas_clear (
 		    canvas, EMACS_SKIA_COLOR (255, r, g, b));
 		  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
@@ -9385,13 +9242,29 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
     }
 }
 
-/* GtkGLArea "render" callback - blit FBO to screen.  */
+/* Drawing area "draw" callback — composite our FBO texture to the
+   window via gdk_cairo_draw_from_gl.  This eliminates the extra FBO
+   copy that GtkGLArea's internal FBO required: we hand our texture
+   directly to GDK for compositing into the window's back buffer.
+
+   gdk_cairo_draw_from_gl handles cross-context fence synchronization
+   internally (glFenceSync/glWaitSync between our context and the
+   paint context), so no manual fence is needed here.  */
 static gboolean
-pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
-		     gpointer user_data)
+pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
+			   gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
+  GdkWindow *gdk_window;
   emacs_skia_surface_t *skia_surface;
+  int width, height, scale;
+
+  if (!FRAME_GDK_GL_CONTEXT (f) || !FRAME_GL_TEXTURE (f))
+    return FALSE;
+
+  gdk_window = gtk_widget_get_window (widget);
+  if (!gdk_window)
+    return FALSE;
 
   /* Use visible bell surface if active, otherwise main surface.  */
   if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
@@ -9399,180 +9272,55 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
   else
     skia_surface = FRAME_SKIA_SURFACE (f);
 
-  /* No FBO at all - just clear to background.  */
-  if (!FRAME_GL_FRAMEBUFFER (f))
+  if (!skia_surface)
     {
-      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-      float r = RED_FROM_ULONG (bg) / 255.0f;
-      float g = GREEN_FROM_ULONG (bg) / 255.0f;
-      float b = BLUE_FROM_ULONG (bg) / 255.0f;
-      float a = (float) f->alpha_background;
-      glClearColor (r, g, b, a);
-      glClear (GL_COLOR_BUFFER_BIT);
-      glFlush ();
-      return TRUE;
-    }
-
-  /* Ensure GtkGLArea's buffers are attached.  */
-  gtk_gl_area_attach_buffers (gl_area);
-
-  /* Flush Skia rendering if we have an active surface.  */
-  if (skia_surface)
-    {
-      emacs_skia_surface_flush (skia_surface);
-      if (FRAME_SKIA_GL_CONTEXT (f))
-	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-
-      /* Re-attach GtkGLArea's buffers after Skia flush.  Skia's
-	 flushAndSubmit() binds our FBO internally, so we need to
-	 restore GtkGLArea's framebuffer as the draw target for the
-	 blit.
-
-	 No fence or glFinish is needed here: Skia's flushAndSubmit()
-	 submits all pending GL commands on the current context, and
-	 the subsequent glBlitFramebuffer runs on the same context.
-	 GL guarantees in-order execution within a single context, so
-	 the blit will always see the completed Skia output.  A fence
-	 would be necessary only if Skia used a separate GL context
-	 (it does not — GrDirectContext wraps the active context).  */
-      gtk_gl_area_attach_buffers (gl_area);
-    }
-  else
-    {
-      /* Surface is NULL — this happens during resize (surface
-	 destroyed, waiting for pgtk_begin_skia_clip to recreate it)
-	 or at startup before the first redisplay.  Clear to an
-	 OPAQUE background so the compositor shows the frame's
-	 background color rather than transparent/stale content.
-
-	 Use alpha=1.0 regardless of f->alpha_background: during
-	 this transient state we want the frame opaque to avoid
-	 flickering to fully transparent between resize and the
-	 next redisplay.
-
-	 Do NOT queue a GtkGLArea render here — that would create
-	 a tight loop.  SET_FRAME_GARBAGED triggers Emacs redisplay
-	 which recreates the surface and queues a render at the
-	 right time.  */
-      unsigned long bg = FRAME_X_OUTPUT (f)->background_color;
-      float r = RED_FROM_ULONG (bg) / 255.0f;
-      float g = GREEN_FROM_ULONG (bg) / 255.0f;
-      float b = BLUE_FROM_ULONG (bg) / 255.0f;
-      glClearColor (r, g, b, 1.0f);
-      glClear (GL_COLOR_BUFFER_BIT);
-      glFlush ();
+      /* Surface is NULL — during resize or before first redisplay.
+	 Nothing to composite.  Trigger a redraw once content exists.  */
       SET_FRAME_GARBAGED (f);
-      return TRUE;
+      return FALSE;
     }
 
-  /* Get source dimensions from the Skia surface.  At this point
-     skia_surface is always non-NULL — the NULL case returns early
-     above.  */
-  int src_width = emacs_skia_surface_get_width (skia_surface);
-  int src_height = emacs_skia_surface_get_height (skia_surface);
+  /* Make our context current and flush Skia rendering.  */
+  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
-  /* Get the destination size from the GtkGLArea's allocation, scaled
-     for HiDPI.  We cannot use glGetIntegerv(GL_VIEWPORT) because for
-     child frames inside a GtkFixed, the viewport may incorrectly
-     reflect the parent frame's size instead of the child's.  */
-  GtkAllocation gl_alloc;
-  gtk_widget_get_allocation (GTK_WIDGET (gl_area), &gl_alloc);
-  int scale = gtk_widget_get_scale_factor (GTK_WIDGET (gl_area));
-  int dst_width = gl_alloc.width * scale;
-  int dst_height = gl_alloc.height * scale;
+  emacs_skia_surface_flush (skia_surface);
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 
-  /* One-time diagnostic: log FBO state and dimensions on first
-     successful blit to help debug compositing issues.  */
+  width = emacs_skia_surface_get_width (skia_surface);
+  height = emacs_skia_surface_get_height (skia_surface);
+  scale = gtk_widget_get_scale_factor (widget);
+
+  /* One-time diagnostic.  */
   {
     static bool logged_once = false;
     if (!logged_once)
       {
-	GLint draw_fbo = 0;
-	glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
 	fprintf (stderr,
-		 "Skia render: draw_fbo=%d, our_fbo=%u, "
-		 "src=%dx%d, dst=%dx%d, scale=%d\n",
-		 draw_fbo, FRAME_GL_FRAMEBUFFER (f),
-		 src_width, src_height, dst_width, dst_height, scale);
+		 "Skia draw: texture=%u, size=%dx%d, scale=%d\n",
+		 FRAME_GL_TEXTURE (f), width, height, scale);
 	logged_once = true;
       }
   }
 
-  /* Set the viewport explicitly to ensure correct rendering for child
-     frames that share their parent's GL context.  */
-  glViewport (0, 0, dst_width, dst_height);
+  /* Hand our FBO texture directly to GDK for compositing.  GDK
+     switches to the window's paint context, inserts a fence sync to
+     wait for our rendering, then draws a textured quad onto the
+     window's back buffer.  For textures with alpha, it also uploads
+     the underlying cairo surface for correct blending.
 
-  /* Disable blending and scissor for the blit.  We write RGBA pixels
-     directly — the alpha channel will be passed through to GTK's
-     compositor for frame transparency (alpha-background).  */
-  glDisable (GL_BLEND);
-  glDisable (GL_SCISSOR_TEST);
+     After this call, our GL context is NO LONGER current — GDK
+     switched to the paint context.  */
+  gdk_cairo_draw_from_gl (cr, gdk_window,
+			  FRAME_GL_TEXTURE (f),
+			  GL_TEXTURE,
+			  scale, 0, 0, width, height);
 
-  if (FRAME_GL_BLIT_PROGRAM (f))
-    {
-      /* Shader-based blit: draw a fullscreen triangle that samples our
-	 FBO texture.  This preserves the alpha channel (unlike
-	 glBlitFramebuffer to an RGB8 renderbuffer which discards it).
-	 GtkGLArea's internal FBO is RGBA8 (has_alpha=TRUE), so the
-	 compositor sees correct per-pixel alpha for transparency.  */
-      glUseProgram (FRAME_GL_BLIT_PROGRAM (f));
-      glActiveTexture (GL_TEXTURE0);
-      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
-      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-		       GL_CLAMP_TO_EDGE);
-      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-		       GL_CLAMP_TO_EDGE);
-      glUniform1i (FRAME_GL_BLIT_TEX_UNIFORM (f), 0);
-      glBindVertexArray (FRAME_GL_BLIT_VAO (f));
-      glDrawArrays (GL_TRIANGLES, 0, 3);
-      glBindVertexArray (0);
-      glBindTexture (GL_TEXTURE_2D, 0);
-      glUseProgram (0);
-    }
-  else
-    {
-      /* Fallback: glBlitFramebuffer if shader creation failed.
-	 This discards alpha (GtkGLArea FBO is RGBA but the blit
-	 path works correctly for opaque content).  */
-      glBindFramebuffer (GL_READ_FRAMEBUFFER,
-			 FRAME_GL_FRAMEBUFFER (f));
-      glBlitFramebuffer (0, 0, src_width, src_height, 0, 0,
-			 dst_width, dst_height,
-			 GL_COLOR_BUFFER_BIT, GL_LINEAR);
-      glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
-    }
-
-  /* Wait for the blit to complete before returning to GTK.
-     glFlush() merely submits commands to the GPU pipeline; on slower
-     GPUs the blit may still be in-flight when GTK reads the FBO to
-     composite it, causing stale content.  Use a fence with a short
-     timeout to wait for completion without risking an indefinite
-     block (which glFinish can cause on a degraded GL context).
-     If the fence times out, the blit was already submitted and will
-     likely complete before the next frame — accept one potentially
-     stale frame rather than freezing Emacs.  */
-  {
-    emacs_skia_fence_t *fence = emacs_skia_fence_create ();
-    if (fence)
-      {
-	/* 50ms is ~3 frame periods at 60Hz — generous for a single
-	   blit, but won't freeze Emacs on a stalled GPU.  */
-	emacs_skia_fence_wait (fence, 50000000ULL);
-	emacs_skia_fence_destroy (fence);
-      }
-    else
-      /* Fence creation failed — fall back to glFlush which at least
-	 submits the commands.  */
-      glFlush ();
-  }
-
-  /* Mark GL state as dirty.  After we return, GTK's
-     gdk_cairo_draw_from_gl (alpha compositing path) will trash GL
-     state (shaders, VAOs, textures, blend).  The next Skia draw in
-     pgtk_begin_skia_clip calls emacs_skia_gl_context_reset() which
-     fully recovers from this.  */
+  /* Mark GL state as dirty.  gdk_cairo_draw_from_gl trashes GL state
+     (shaders, VAOs, textures, blend) in the paint context, and our
+     context is no longer current.  The next Skia draw in
+     pgtk_begin_skia_clip calls emacs_skia_gl_context_reset to
+     recover.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
 
   return TRUE;
@@ -9652,150 +9400,18 @@ pgtk_resize_fbo_preserve_content (struct frame *f, int old_width,
   glBindFramebuffer (GL_FRAMEBUFFER, 0);
 }
 
-/* GtkGLArea "resize" callback - resize FBO to match widget.  */
-static void
-pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
-		     gpointer user_data)
-{
-  struct frame *f = (struct frame *) user_data;
-
-  if (width <= 0 || height <= 0)
-    return;
-
-  /* Make context current before GL operations.  */
-  gtk_gl_area_make_current (gl_area);
-
-  /* Check actual FBO texture size, not just desired dimensions.
-     This handles the case where pgtk_skia_update_surface_desired_size
-     updated the desired dimensions before this callback ran.  */
-  int fbo_width = 0, fbo_height = 0;
-  if (FRAME_GL_TEXTURE (f))
-    {
-      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
-      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-				&fbo_width);
-      glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-				&fbo_height);
-      glBindTexture (GL_TEXTURE_2D, 0);
-    }
-
-  /* Destroy the old Skia surface if size changed.  The surface will
-     be recreated on next draw with the new size.  */
-  if (fbo_width != width || fbo_height != height)
-    {
-      /* Destroy only the Skia surface, keep the GL context.  */
-      if (FRAME_SKIA_SURFACE (f))
-	{
-	  if (FRAME_SKIA_GL_CONTEXT (f))
-	    {
-	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      pgtk_gl_finish_with_timeout ("gl_area_resize_flush");
-	    }
-	  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
-	  FRAME_SKIA_SURFACE (f) = NULL;
-	  FRAME_SKIA_CANVAS (f) = NULL;
-	}
-
-      /* Resize the FBO texture, preserving existing content.  */
-      if (FRAME_GL_FRAMEBUFFER (f) && FRAME_GL_TEXTURE (f))
-	pgtk_resize_fbo_preserve_content (f, fbo_width, fbo_height,
-					  width, height);
-
-      FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
-      FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
-
-      /* The surface will be recreated on next draw in
-	 pgtk_begin_skia_clip.  Mark frame as garbaged to trigger a
-	 full redraw.  Do NOT queue a GtkGLArea render here — Emacs
-	 redisplay hasn't drawn content yet, so the render callback
-	 would blit an empty surface.  Instead, let redisplay run
-	 first; pgtk_frame_up_to_date will queue the render after
-	 content has been drawn.  */
-      SET_FRAME_GARBAGED (f);
-    }
-}
-
-/* Create and set up GL context for frame F (fallback when no
- * GtkGLArea).  */
-static bool
-pgtk_init_gl_area (struct frame *f)
-{
-  GtkWidget *fixed;
-  GdkWindow *gdk_window;
-  GdkGLContext *gl_context;
-  GError *error = NULL;
-
-  if (FRAME_GDK_GL_CONTEXT (f))
-    return true; /* Already initialized.  */
-
-  fixed = FRAME_GTK_WIDGET (f);
-
-  /* Make the fixed widget app-paintable so it doesn't draw
-   * background.  */
-  gtk_widget_set_app_paintable (fixed, TRUE);
-
-  /* Get the GdkWindow from the widget.  */
-  gdk_window = gtk_widget_get_window (fixed);
-  if (!gdk_window)
-    return false;
-
-  /* Create a GL context directly from the GdkWindow.  */
-  gl_context = gdk_window_create_gl_context (gdk_window, &error);
-  if (!gl_context)
-    {
-      if (error)
-	g_error_free (error);
-      return false;
-    }
-
-  /* Realize the context (required before use).  */
-  if (!gdk_gl_context_realize (gl_context, &error))
-    {
-      if (error)
-	g_error_free (error);
-      g_object_unref (gl_context);
-      return false;
-    }
-
-  FRAME_GDK_GL_CONTEXT (f) = gl_context;
-
-  /* Make the context current.  */
-  gdk_gl_context_make_current (gl_context);
-
-  /* Create Skia GL context using the native GL interface.  */
-  FRAME_SKIA_GL_CONTEXT (f) = emacs_skia_gl_context_create_native ();
-
-  if (!FRAME_SKIA_GL_CONTEXT (f))
-    {
-      g_object_unref (gl_context);
-      FRAME_GDK_GL_CONTEXT (f) = NULL;
-      return false;
-    }
-
-  /* Create GL framebuffer and texture for offscreen rendering.  */
-  glGenFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
-  glGenTextures (1, &FRAME_GL_TEXTURE (f));
-
-  /* Initialize GL state as dirty so Skia resets on first use.  */
-  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
-  FRAME_GL_TIMEOUT_COUNT (f) = 0;
-  FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
-
-  FRAME_SKIA_GL_INITIALIZED (f) = true;
-  /* No GtkGLArea - we use direct GdkGLContext.  */
-  FRAME_GL_AREA (f) = NULL;
-
-  return true;
-}
-
-/* Legacy init function - now just calls pgtk_init_gl_area.  */
+/* Legacy init function — now the GL context is created in
+   pgtk_gl_drawing_area_realize.  This is kept for the fallback path
+   in pgtk_begin_skia_clip.  */
 static bool
 pgtk_init_gl_context (struct frame *f)
 {
   if (FRAME_SKIA_GL_INITIALIZED (f))
     return FRAME_GDK_GL_CONTEXT (f) != NULL;
 
-  return pgtk_init_gl_area (f);
+  /* The drawing area realize callback handles initialization.
+     If we get here without a context, it hasn't realized yet.  */
+  return false;
 }
 
 /* Set up GL framebuffer for rendering at given size.  */
@@ -9987,8 +9603,7 @@ pgtk_cleanup_gl_context (struct frame *f)
       FRAME_GDK_GL_CONTEXT (f) = NULL;
     }
 
-  /* No GtkGLArea to destroy - we use direct GdkGLContext.  */
-  FRAME_GL_AREA (f) = NULL;
+  FRAME_GL_DRAWING_AREA (f) = NULL;
 
   FRAME_SKIA_GL_INITIALIZED (f) = false;
 }
@@ -10003,9 +9618,9 @@ pgtk_skia_update_surface_desired_size (struct frame *f, int width,
   if (FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) != width
       || FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) != height || force)
     {
-      /* Only destroy the Skia surface, preserve the GtkGLArea and GL
-	 context.  This avoids recreating the entire GL setup on every
-	 resize, which causes flickering.  */
+      /* Only destroy the Skia surface, preserve the GL context.
+	 This avoids recreating the entire GL setup on every resize,
+	 which causes flickering.  */
       pgtk_skia_destroy_surface_only (f);
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
@@ -10020,51 +9635,46 @@ pgtk_begin_skia_clip (struct frame *f)
 
   if (!canvas)
     {
-      int width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
-      int height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+      int logical_width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
+      int logical_height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
 
-      if (width <= 0)
-	width = 1;
-      if (height <= 0)
-	height = 1;
+      if (logical_width <= 0)
+	logical_width = 1;
+      if (logical_height <= 0)
+	logical_height = 1;
+
+      /* Scale to device pixels for the FBO and Skia surface.  On
+	 HiDPI displays (scale > 1), the texture is larger than the
+	 logical window so that each CSS pixel maps to multiple device
+	 pixels, producing crisp text and graphics.  The Skia canvas
+	 gets a scale transform so drawing code can continue using
+	 logical pixel coordinates.  */
+      int scale = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+      int width = logical_width * scale;
+      int height = logical_height * scale;
 
       /* If we've exceeded the maximum number of consecutive surface
 	 creation failures, don't attempt again.  The counter is reset
-	 when the GL context is re-realized (pgtk_gl_area_realize) or
+	 when the GL context is re-realized or
 	 when the surface is successfully created.  */
       if (FRAME_GL_SURFACE_CREATION_FAILURES (f)
 	  >= SKIA_MAX_SURFACE_CREATION_FAILURES)
 	return NULL;
 
-      /* Use GtkGLArea's context if available.  */
-      if (FRAME_GL_AREA (f) && FRAME_GDK_GL_CONTEXT (f))
+      /* Use drawing area's context if available.  */
+      if (FRAME_GL_DRAWING_AREA (f) && FRAME_GDK_GL_CONTEXT (f))
 	{
-	  /* Make the GtkGLArea's context current.  */
-	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
-
-	  /* Check if the GL context is valid after make_current.  */
-	  GError *gl_error
-	    = gtk_gl_area_get_error (GTK_GL_AREA (FRAME_GL_AREA (f)));
-	  if (gl_error != NULL)
-	    {
-	      /* GL context is invalid - cannot draw.  This happens
-		 when the context is lost (e.g., display sleep, driver
-		 issues). The unrealize callback should clean up and
-		 realize will recreate the context.  */
-	      fprintf (stderr,
-		       "Skia: GL context error in begin_skia_clip: "
-		       "%s\n",
-		       gl_error->message);
-	      return NULL;
-	    }
+	  /* Make our GL context current.  */
+	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
 	  /* Clear any stale GL errors.  */
 	  while (glGetError () != GL_NO_ERROR)
 	    ;
 
 	  /* Ensure the FBO exists and is complete before drawing.  This
-	     handles driver/context loss without relying on GtkGLArea
-	     unrealize.  */
+	     handles driver/context loss.  */
 	  bool fbo_recreated = false;
 	  if (!pgtk_ensure_gl_framebuffer (f, width, height, &fbo_recreated))
 	    {
@@ -10121,7 +9731,7 @@ pgtk_begin_skia_clip (struct frame *f)
 		}
 	    }
 	}
-      /* Fallback: create offscreen GL context if no GtkGLArea.  */
+      /* Fallback: create offscreen GL context if no drawing area.  */
       else if (pgtk_init_gl_context (f)
 	       && pgtk_ensure_gl_framebuffer (f, width, height, NULL))
 	{
@@ -10184,6 +9794,13 @@ pgtk_begin_skia_clip (struct frame *f)
 	}
       FRAME_SKIA_CANVAS (f) = canvas;
 
+      /* Apply HiDPI scale transform so drawing code works in logical
+	 pixels while the underlying surface has device-pixel
+	 resolution.  This is the base transform for all subsequent
+	 save/restore cycles in pgtk_begin/end_skia_clip.  */
+      if (scale > 1)
+	emacs_skia_canvas_scale (canvas, (float) scale, (float) scale);
+
       /* Create a reusable paint object.  */
       if (!FRAME_SKIA_PAINT (f))
 	{
@@ -10221,43 +9838,24 @@ pgtk_begin_skia_clip (struct frame *f)
     }
   else if (FRAME_GDK_GL_CONTEXT (f))
     {
-      int width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
-      int height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+      int logical_w = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
+      int logical_h = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
 
-      if (width <= 0)
-	width = 1;
-      if (height <= 0)
-	height = 1;
+      if (logical_w <= 0)
+	logical_w = 1;
+      if (logical_h <= 0)
+	logical_h = 1;
+
+      /* Scale to device pixels, matching the FBO dimensions.  */
+      int sc = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+      int width = logical_w * sc;
+      int height = logical_h * sc;
 
       /* For GL surfaces, ensure the GL context is current before any
 	 drawing operations.  Skia's GL backend requires this.  */
-      if (FRAME_GL_AREA (f))
-	{
-	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
-
-	  /* Check if the GL context is still valid.  */
-	  GError *gl_error
-	    = gtk_gl_area_get_error (GTK_GL_AREA (FRAME_GL_AREA (f)));
-	  if (gl_error != NULL)
-	    {
-	      /* GL context is invalid - need to recreate.  Clear the
-		 cached canvas/surface so the next call recreates
-		 them.  */
-	      fprintf (stderr,
-		       "Skia: GL context lost in begin_skia_clip "
-		       "(existing canvas): %s\n",
-		       gl_error->message);
-	      FRAME_SKIA_CANVAS (f) = NULL;
-	      if (FRAME_SKIA_SURFACE (f))
-		{
-		  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
-		  FRAME_SKIA_SURFACE (f) = NULL;
-		}
-	      return NULL;
-	    }
-	}
-      else
-	gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
       /* Tell Skia to re-query GL state since GTK/GDK may have
 	 modified it between frames.  Without this, Skia's cached GL
@@ -10337,7 +9935,7 @@ pgtk_skia_set_paint_color (struct frame *f, unsigned long color,
   }
 }
 
-/* Destroy only the Skia surface, preserving GL context and GtkGLArea.
+/* Destroy only the Skia surface, preserving GL context.
    Used during resize to avoid recreating the entire GL setup.  */
 static void
 pgtk_skia_destroy_surface_only (struct frame *f)
@@ -10355,28 +9953,14 @@ pgtk_skia_destroy_surface_only (struct frame *f)
     {
       /* For GL surfaces, make context current and flush before
 	 destroying to ensure any pending operations complete and
-	 the GrDirectContext state is clean.  Use
-	 gtk_gl_area_make_current when GtkGLArea is present to
-	 maintain GTK's internal state tracking; fall back to
-	 gdk_gl_context_make_current only for the direct GdkGLContext
-	 path.  */
-      if (FRAME_GL_AREA (f))
-	{
-	  gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
-	  if (FRAME_SKIA_GL_CONTEXT (f))
-	    {
-	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      pgtk_gl_finish_with_timeout ("destroy_surface_only");
-	    }
-	}
-      else if (FRAME_GDK_GL_CONTEXT (f))
+	 the GrDirectContext state is clean.  */
+      if (FRAME_GDK_GL_CONTEXT (f))
 	{
 	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 	  if (FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      pgtk_gl_finish_with_timeout (
-		"destroy_surface_only_fallback");
+	      pgtk_gl_finish_with_timeout ("destroy_surface_only");
 	    }
 	}
       emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));

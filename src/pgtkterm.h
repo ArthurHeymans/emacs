@@ -438,8 +438,13 @@ struct pgtk_output
   emacs_skia_paint_t *skia_paint; /* Reusable paint object */
   emacs_skia_surface_t *skia_surface_visible_bell;
   bool skia_gl_initialized;
-  /* Skia GL rendering support.  */
-  GtkWidget *gl_area;
+  /* Skia GL rendering support.  We use a GtkDrawingArea with an
+     explicit GdkGLContext (created via gdk_window_create_gl_context)
+     instead of GtkGLArea.  Skia renders into our own FBO, and the
+     draw callback hands the FBO texture directly to
+     gdk_cairo_draw_from_gl for compositing — eliminating the extra
+     FBO copy that GtkGLArea's internal FBO would require.  */
+  GtkWidget *gl_drawing_area;
   GdkGLContext *gdk_gl_context;
   unsigned int gl_framebuffer;
   unsigned int gl_texture;
@@ -456,18 +461,6 @@ struct pgtk_output
      attempting surface creation to avoid flooding stderr.  Reset to 0
      on successful creation or GL context re-realize.  */
   int gl_surface_creation_failures;
-  /* Whether the GtkGLArea has been shown.  We defer showing it until
-     after the first successful Emacs redisplay so that GTK's automatic
-     first render doesn't composite an empty/transparent FBO.  */
-  bool gl_area_shown;
-  /* GL blit shader resources for alpha-aware FBO-to-screen transfer.
-     Instead of glBlitFramebuffer (which discards alpha when the target
-     is RGB8), we use a fullscreen triangle with a trivial shader to
-     copy our RGBA FBO texture into GtkGLArea's RGBA FBO, preserving
-     alpha for compositor transparency.  */
-  unsigned int gl_blit_program;
-  unsigned int gl_blit_vao;
-  int gl_blit_tex_uniform;
 #endif
   struct atimer *atimer_visible_bell;
 
@@ -592,7 +585,7 @@ enum
     ((f)->output_data.pgtk->skia_surface_desired_height)
 # define FRAME_SKIA_GL_INITIALIZED(f) \
      ((f)->output_data.pgtk->skia_gl_initialized)
-# define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
+# define FRAME_GL_DRAWING_AREA(f) ((f)->output_data.pgtk->gl_drawing_area)
 # define FRAME_GDK_GL_CONTEXT(f) ((f)->output_data.pgtk->gdk_gl_context)
 # define FRAME_GL_FRAMEBUFFER(f) ((f)->output_data.pgtk->gl_framebuffer)
 # define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
@@ -606,12 +599,7 @@ enum
    failures.  Prevents flooding stderr with identical error messages
    when the GL context is permanently broken.  */
 # define SKIA_MAX_SURFACE_CREATION_FAILURES 3
-# define FRAME_GL_BLIT_PROGRAM(f) \
-    ((f)->output_data.pgtk->gl_blit_program)
-# define FRAME_GL_BLIT_VAO(f) \
-    ((f)->output_data.pgtk->gl_blit_vao)
-# define FRAME_GL_BLIT_TEX_UNIFORM(f) \
-    ((f)->output_data.pgtk->gl_blit_tex_uniform)
+
 #endif
 
 
