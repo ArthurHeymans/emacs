@@ -586,11 +586,10 @@ pgtk_free_frame_resources (struct frame *f)
   gtk_widget_destroy (FRAME_WIDGET (f));
 
 #ifdef USE_SKIA
-  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell != NULL)
+  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell != NULL)
     {
-      emacs_skia_surface_destroy (
-	FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
-      FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
+      emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+      FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
     }
 #else
   if (FRAME_X_OUTPUT (f)->cr_surface_visible_bell != NULL)
@@ -4881,15 +4880,42 @@ recover_from_visible_bell (struct atimer *timer)
   struct frame *f = timer->client_data;
 
 #ifdef USE_SKIA
-  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell != NULL)
+  block_input ();
+
+  /* Restore the pre-flash surface content from the saved snapshot.
+     The snapshot is at device-pixel resolution; temporarily undo the
+     canvas HiDPI scale so the image maps 1:1 to device pixels.  */
+  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell && FRAME_SKIA_CANVAS (f))
     {
-      emacs_skia_surface_destroy (
-	FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
-      FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
-      /* Queue a re-draw so the drawing area repaints without the bell.  */
-      if (FRAME_GL_DRAWING_AREA (f))
-	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+      emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (f);
+      int scale = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+      emacs_skia_canvas_save (canvas);
+      if (scale > 1)
+	emacs_skia_canvas_scale (canvas, 1.0f / scale, 1.0f / scale);
+      emacs_skia_canvas_draw_image (canvas,
+				    FRAME_X_OUTPUT (f)->skia_image_pre_bell,
+				    0, 0, NULL);
+      emacs_skia_canvas_restore (canvas);
+
+      /* Flush the restored content to the GL texture.  */
+      emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
     }
+
+  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
+    {
+      emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+      FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+    }
+
+  /* Queue a draw to composite the restored content.  */
+  if (FRAME_GL_DRAWING_AREA (f))
+    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+
+  unblock_input ();
 #else
   if (FRAME_X_OUTPUT (f)->cr_surface_visible_bell != NULL)
     {
@@ -4909,64 +4935,72 @@ static void
 pgtk_flash (struct frame *f)
 {
 #ifdef USE_SKIA
-  emacs_skia_surface_t *surface_orig = FRAME_SKIA_SURFACE (f);
-  emacs_skia_surface_t *surface;
   emacs_skia_canvas_t *canvas;
   emacs_skia_paint_t *paint;
-  emacs_skia_image_t *snapshot;
-  int width, height, flash_height, flash_left, flash_right;
+  int height, flash_height, flash_left, flash_right, width;
   struct timespec delay;
 
-  if (!surface_orig)
+  if (!FRAME_SKIA_SURFACE (f) || !FRAME_SKIA_CANVAS (f))
     return;
 
   block_input ();
 
-  width = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
-  height = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+  /* Draw the flash effect directly onto the main GL-backed Skia
+     surface.  The canvas already has the HiDPI scale transform, so
+     all coordinates are in logical pixels (matching FRAME_PIXEL_*
+     macros).  We save a snapshot before drawing so
+     recover_from_visible_bell can restore the original content
+     without a full redisplay (which would be racy — concurrent
+     redraws during the 50ms flash window would composite on top of
+     the inverted region).
 
-  if (width <= 0 || height <= 0)
+     If a previous flash is still active (rapid bell invocations),
+     restore the prior snapshot first to avoid double-inversion.  */
+  canvas = FRAME_SKIA_CANVAS (f);
+
+  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
     {
-      unblock_input ();
-      return;
+      /* Restore previous pre-bell content before re-flashing.
+	 The snapshot is at device-pixel resolution, but the canvas
+	 has a HiDPI scale transform.  Temporarily undo the scale
+	 so the image maps 1:1 to device pixels.  */
+      int scale = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+      emacs_skia_canvas_save (canvas);
+      if (scale > 1)
+	emacs_skia_canvas_scale (canvas, 1.0f / scale, 1.0f / scale);
+      emacs_skia_canvas_draw_image (canvas,
+				    FRAME_X_OUTPUT (f)->skia_image_pre_bell,
+				    0, 0, NULL);
+      emacs_skia_canvas_restore (canvas);
+      emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+      FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
     }
 
-  /* Create a new surface for the flash effect */
-  surface = emacs_skia_surface_create_raster (width, height);
-  if (!surface)
-    {
-      unblock_input ();
-      return;
-    }
+  /* Flush pending draws before snapshotting.  */
+  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
 
-  canvas = emacs_skia_surface_get_canvas (surface);
-  if (!canvas)
-    {
-      emacs_skia_surface_destroy (surface);
-      unblock_input ();
-      return;
-    }
+  /* Save a snapshot of the clean surface for restoration.  */
+  FRAME_X_OUTPUT (f)->skia_image_pre_bell
+    = emacs_skia_surface_make_image_snapshot (FRAME_SKIA_SURFACE (f));
+
   paint = emacs_skia_paint_create ();
   if (!paint)
     {
-      emacs_skia_surface_destroy (surface);
+      /* Clean up the snapshot we just saved — no timer will be
+	 started, so nothing would restore/free it otherwise.  */
+      if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
+	{
+	  emacs_skia_image_destroy (
+	    FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+	  FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+	}
       unblock_input ();
       return;
     }
 
-  /* Flush the original surface before taking a snapshot, in case it
-     is GPU-backed and has pending draw operations.  */
-  emacs_skia_surface_flush (surface_orig);
-
-  /* Copy original surface content */
-  snapshot = emacs_skia_surface_make_image_snapshot (surface_orig);
-  if (snapshot)
-    {
-      emacs_skia_canvas_draw_image (canvas, snapshot, 0, 0, NULL);
-      emacs_skia_image_destroy (snapshot);
-    }
-
-  /* Set up for DIFFERENCE blend mode with white color */
+  /* Set up for DIFFERENCE blend mode with white color.  */
   emacs_skia_paint_set_color (paint,
 			      EMACS_SKIA_COLOR_RGB (255, 255, 255));
   emacs_skia_paint_set_blend_mode (paint,
@@ -5016,11 +5050,13 @@ pgtk_flash (struct frame *f)
 
   emacs_skia_paint_destroy (paint);
 
-  /* Store the flash surface for later restoration */
-  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
-    emacs_skia_surface_destroy (
-      FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
-  FRAME_X_OUTPUT (f)->skia_surface_visible_bell = surface;
+  /* Flush the flash into the GL texture and queue a draw so the
+     compositing callback displays it immediately.  */
+  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+  if (FRAME_GL_DRAWING_AREA (f))
+    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
 
   delay = make_timespec (0, 50 * 1000 * 1000);
 
@@ -9034,20 +9070,19 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
   if (FRAME_SKIA_GL_CONTEXT (f))
     emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 
+  /* Destroy pre-bell snapshot (holds GPU texture reference).  */
+  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
+    {
+      emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+      FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+    }
+
   /* Destroy Skia surface first (it references the GL context).  */
   if (FRAME_SKIA_SURFACE (f))
     {
       emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
       FRAME_SKIA_SURFACE (f) = NULL;
       FRAME_SKIA_CANVAS (f) = NULL;
-    }
-
-  /* Destroy the visible bell surface if any.  */
-  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
-    {
-      emacs_skia_surface_destroy (
-	FRAME_X_OUTPUT (f)->skia_surface_visible_bell);
-      FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
     }
 
   /* Destroy paint object.  */
@@ -9266,11 +9301,7 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
   if (!gdk_window)
     return FALSE;
 
-  /* Use visible bell surface if active, otherwise main surface.  */
-  if (FRAME_X_OUTPUT (f)->skia_surface_visible_bell)
-    skia_surface = FRAME_X_OUTPUT (f)->skia_surface_visible_bell;
-  else
-    skia_surface = FRAME_SKIA_SURFACE (f);
+  skia_surface = FRAME_SKIA_SURFACE (f);
 
   if (!skia_surface)
     {

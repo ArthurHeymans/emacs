@@ -1743,11 +1743,11 @@ This function is an internal primitive--use `make-frame' instead.  */ )
 
   FRAME_X_OUTPUT (f)->border_color_css_provider = NULL;
 
+#ifdef USE_SKIA
+  FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+#endif
 #ifdef USE_CAIRO
   FRAME_X_OUTPUT (f)->cr_surface_visible_bell = NULL;
-#endif
-#ifdef USE_SKIA
-  FRAME_X_OUTPUT (f)->skia_surface_visible_bell = NULL;
 #endif
   FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
   /* Initialize to actual scale factor to avoid unnecessary surface

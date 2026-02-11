@@ -436,7 +436,11 @@ struct pgtk_output
   emacs_skia_gl_context_t *skia_gl_context;
   int skia_surface_desired_width, skia_surface_desired_height;
   emacs_skia_paint_t *skia_paint; /* Reusable paint object */
-  emacs_skia_surface_t *skia_surface_visible_bell;
+  /* Snapshot of the GL surface taken before a visible bell flash.
+     Used to restore the original content when the flash timer fires,
+     avoiding a full redisplay and preventing corruption from
+     concurrent drawing during the flash window.  */
+  emacs_skia_image_t *skia_image_pre_bell;
   bool skia_gl_initialized;
   /* Skia GL rendering support.  We use a GtkDrawingArea with an
      explicit GdkGLContext (created via gdk_window_create_gl_context)
