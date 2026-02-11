@@ -9005,53 +9005,6 @@ pgtk_check_gl_error (const char *context)
   return false;
 }
 
-/* Wait for GPU operations to complete using a non-blocking fence with
-   timeout.  This replaces glFinish() which can block indefinitely and
-   freeze Emacs when the GPU is in a bad state.  Returns true if the
-   GPU completed in time, false on timeout.  */
-static bool
-pgtk_gl_finish_with_timeout (const char *context)
-{
-  /* Flush any buffered GL commands before creating the fence.
-     Without this, some drivers may not have submitted commands to
-     the GPU yet, and the fence could signal immediately without
-     actually waiting for the intended work to complete.  */
-  glFlush ();
-
-  emacs_skia_fence_t *fence = emacs_skia_fence_create ();
-  if (fence)
-    {
-      /* 200ms timeout — generous enough for legitimate GPU work,
-	 short enough to avoid perceptible hangs.  */
-      const uint64_t timeout_ns = 200000000ULL;
-      bool completed = emacs_skia_fence_wait (fence, timeout_ns);
-      emacs_skia_fence_destroy (fence);
-
-      if (!completed)
-	{
-	  fprintf (stderr,
-		   "Skia: GL sync timed out in %s - "
-		   "possible GPU stall\n",
-		   context);
-	  pgtk_check_gl_error (context);
-	}
-      return completed;
-    }
-  else
-    {
-      /* Fence creation failed — GL context may be broken.  Don't
-	 fall back to glFinish() as that can block forever and freeze
-	 Emacs.  Callers that destroy GPU resources after this may
-	 trigger GPU-side use-after-free, but GPU drivers handle this
-	 gracefully (deferred deletion).  The alternative — an
-	 indefinite hang — is far worse.  */
-      fprintf (stderr, "Skia: fence creation failed in %s\n",
-	       context);
-      pgtk_check_gl_error (context);
-      return false;
-    }
-}
-
 /* Drawing area "unrealize" callback - clean up GL resources when
    the widget's GdkWindow is about to be destroyed.  */
 static void
@@ -9124,7 +9077,6 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
 
   FRAME_SKIA_GL_INITIALIZED (f) = false;
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
-  FRAME_GL_TIMEOUT_COUNT (f) = 0;
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   /* Mark frame as garbaged so it gets redrawn when realized again. */
@@ -9210,7 +9162,6 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
 
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
-  FRAME_GL_TIMEOUT_COUNT (f) = 0;
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
@@ -9268,7 +9219,7 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
 		  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
 		  emacs_skia_gl_context_flush (
 		    FRAME_SKIA_GL_CONTEXT (f));
-		  pgtk_gl_finish_with_timeout ("realize_eager_clear");
+		  glFinish ();
 		  emacs_skia_gl_context_reset (
 		    FRAME_SKIA_GL_CONTEXT (f));
 		}
@@ -9421,9 +9372,8 @@ pgtk_resize_fbo_preserve_content (struct frame *f, int old_width,
   glBlitFramebuffer (0, 0, blit_width, blit_height, 0, 0, blit_width,
 		     blit_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-  /* Wait for GPU to finish the blit operations.  Use non-blocking
-     fence with timeout to prevent indefinite hangs.  */
-  pgtk_gl_finish_with_timeout ("resize_fbo_preserve_content");
+  /* Wait for GPU to finish the blit operations.  */
+  glFinish ();
 
   /* Clean up temp resources.  */
   glDeleteFramebuffers (1, &temp_fbo);
@@ -9528,7 +9478,7 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
      The actual background color will be set when Skia draws.  */
   glClearColor (0.0f, 0.0f, 0.0f, 1.0f);
   glClear (GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-  pgtk_gl_finish_with_timeout ("setup_gl_framebuffer");
+  glFinish ();
 
   /* Unbind the framebuffer.  */
   glBindFramebuffer (GL_FRAMEBUFFER, 0);
@@ -9860,7 +9810,7 @@ pgtk_begin_skia_clip (struct frame *f)
 	if (FRAME_SKIA_GL_CONTEXT (f))
 	  {
 	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	    pgtk_gl_finish_with_timeout ("begin_skia_clip_init");
+	    glFinish ();
 	    /* Reset Skia state after initial setup.  */
 	    emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
 	    FRAME_SKIA_GL_STATE_DIRTY (f) = false;
@@ -9991,7 +9941,7 @@ pgtk_skia_destroy_surface_only (struct frame *f)
 	  if (FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	      pgtk_gl_finish_with_timeout ("destroy_surface_only");
+	      glFinish ();
 	    }
 	}
       emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
