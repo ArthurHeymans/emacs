@@ -8221,6 +8221,8 @@ static gboolean pgtk_gl_area_render (GtkGLArea *, GdkGLContext *,
 static void pgtk_gl_area_resize (GtkGLArea *, gint, gint, gpointer);
 static bool pgtk_setup_gl_framebuffer (struct frame *, int, int);
 static bool pgtk_check_gl_error (const char *);
+static bool pgtk_create_blit_shader (struct frame *);
+static void pgtk_destroy_blit_shader (struct frame *);
 #endif
 
 void
@@ -8309,25 +8311,25 @@ pgtk_set_event_handler (struct frame *f)
        use its FBO as a blit target.  */
     gtk_gl_area_set_has_stencil_buffer (GTK_GL_AREA (gl_area), FALSE);
     gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
-    /* CRITICAL: Do NOT set has_alpha to TRUE.  With has_alpha=TRUE,
-       GTK3 uses a GL_TEXTURE_2D for the internal FBO color attachment
-       and gdk_cairo_draw_from_gl takes the alpha-compositing path
-       (gdkgl.c:526-656), which uploads the existing window background
-       to a texture, enables GL_BLEND, and draws our content on top.
-       This is extremely fragile: any pixel with alpha < 1.0 gets
-       blended with potentially uninitialized window background, and
-       the whole process trashes GL state (shaders, VAOs, textures).
+    /* Enable has_alpha so GtkGLArea's internal FBO is RGBA8 and the
+       compositor can see per-pixel alpha for frame transparency
+       (alpha-background).
 
-       With has_alpha=FALSE, GtkGLArea uses a GL_RENDERBUFFER (RGB8)
-       and gdk_cairo_draw_from_gl takes the simpler direct-blit path
-       (gdkgl.c:423-524) which uses glBlitFramebuffer with no alpha
-       compositing.  Our offscreen FBO content (with alpha=1.0 for
-       normal backgrounds) is blitted directly.
-
-       If frame transparency (alpha-background) is needed, it should
-       be handled at the compositor level, not through GtkGLArea's
-       alpha channel.  */
-    gtk_gl_area_set_has_alpha (GTK_GL_AREA (gl_area), FALSE);
+       With has_alpha=TRUE, GTK3 uses a GL_TEXTURE_2D for the internal
+       FBO and gdk_cairo_draw_from_gl takes the alpha-compositing path
+       (gdkgl.c:526-656), which trashes GL state (shaders, VAOs,
+       textures).  This is safe because:
+       1. We use a shader-based blit (not glBlitFramebuffer) to copy
+          our RGBA FBO into GtkGLArea's RGBA FBO, preserving alpha.
+       2. The GL state trashing happens AFTER our render callback
+          returns, between frames.
+       3. pgtk_begin_skia_clip() calls emacs_skia_gl_context_reset()
+          (GrDirectContext::resetContext(kAll)) before every Skia draw,
+          which fully recovers all trashed GL state.
+       4. The startup transparent-frame bug is prevented by the eager
+          FBO clear in pgtk_gl_area_realize() which writes alpha=1.0
+          (fully opaque) before the first render.  */
+    gtk_gl_area_set_has_alpha (GTK_GL_AREA (gl_area), TRUE);
 
     /* Connect GtkGLArea signals.  */
     g_signal_connect (G_OBJECT (gl_area), "realize",
@@ -9057,6 +9059,142 @@ pgtk_gl_finish_with_timeout (const char *context)
     }
 }
 
+/* Shader source for alpha-aware FBO-to-screen blit.
+
+   Instead of glBlitFramebuffer (which requires matching FBO formats
+   and discards alpha when the target is RGB8), we draw a fullscreen
+   triangle that samples the offscreen RGBA FBO texture.  This
+   preserves per-pixel alpha so GtkGLArea (with has_alpha=TRUE) can
+   hand correct alpha to the compositor for frame transparency.
+
+   The vertex shader generates a fullscreen triangle from gl_VertexID
+   alone (no vertex buffer needed).  The fragment shader is a trivial
+   texture passthrough.  */
+static const char *blit_vertex_shader_src =
+  "#version 150\n"
+  "out vec2 v_uv;\n"
+  "void main () {\n"
+  "  /* Generate a triangle that covers [-1,1]x[-1,1]:\n"
+  "     id=0 -> (-1,-1), id=1 -> (3,-1), id=2 -> (-1,3) */\n"
+  "  float x = float ((gl_VertexID << 1) & 2) * 2.0 - 1.0;\n"
+  "  float y = float (gl_VertexID & 2) * 2.0 - 1.0;\n"
+  "  v_uv = vec2 ((x + 1.0) * 0.5, (y + 1.0) * 0.5);\n"
+  "  gl_Position = vec4 (x, y, 0.0, 1.0);\n"
+  "}\n";
+
+static const char *blit_fragment_shader_src =
+  "#version 150\n"
+  "in vec2 v_uv;\n"
+  "out vec4 frag_color;\n"
+  "uniform sampler2D u_texture;\n"
+  "void main () {\n"
+  "  frag_color = texture (u_texture, v_uv);\n"
+  "}\n";
+
+/* Compile a single shader.  Returns the shader ID, or 0 on failure.  */
+static GLuint
+pgtk_compile_shader (GLenum type, const char *source)
+{
+  GLuint shader = glCreateShader (type);
+  if (!shader)
+    return 0;
+
+  glShaderSource (shader, 1, &source, NULL);
+  glCompileShader (shader);
+
+  GLint status = 0;
+  glGetShaderiv (shader, GL_COMPILE_STATUS, &status);
+  if (!status)
+    {
+      char log[512];
+      glGetShaderInfoLog (shader, sizeof log, NULL, log);
+      fprintf (stderr, "Skia: shader compile error: %s\n", log);
+      glDeleteShader (shader);
+      return 0;
+    }
+  return shader;
+}
+
+/* Create the blit shader program, VAO, and uniform locations for a
+   frame.  Called from pgtk_gl_area_realize after the GL context is
+   ready.  Returns true on success.  */
+static bool
+pgtk_create_blit_shader (struct frame *f)
+{
+  GLuint vs = pgtk_compile_shader (GL_VERTEX_SHADER,
+				   blit_vertex_shader_src);
+  if (!vs)
+    return false;
+
+  GLuint fs = pgtk_compile_shader (GL_FRAGMENT_SHADER,
+				   blit_fragment_shader_src);
+  if (!fs)
+    {
+      glDeleteShader (vs);
+      return false;
+    }
+
+  GLuint program = glCreateProgram ();
+  if (!program)
+    {
+      glDeleteShader (vs);
+      glDeleteShader (fs);
+      return false;
+    }
+  glAttachShader (program, vs);
+  glAttachShader (program, fs);
+  glLinkProgram (program);
+
+  /* Shaders can be detached/deleted after linking.  */
+  glDetachShader (program, vs);
+  glDetachShader (program, fs);
+  glDeleteShader (vs);
+  glDeleteShader (fs);
+
+  GLint status = 0;
+  glGetProgramiv (program, GL_LINK_STATUS, &status);
+  if (!status)
+    {
+      char log[512];
+      glGetProgramInfoLog (program, sizeof log, NULL, log);
+      fprintf (stderr, "Skia: blit program link error: %s\n", log);
+      glDeleteProgram (program);
+      return false;
+    }
+
+  GLint tex_loc = glGetUniformLocation (program, "u_texture");
+
+  /* Core profile requires a VAO to be bound for any draw call.
+     We use an empty VAO since the vertex shader generates positions
+     from gl_VertexID.  */
+  GLuint vao = 0;
+  glGenVertexArrays (1, &vao);
+
+  FRAME_GL_BLIT_PROGRAM (f) = program;
+  FRAME_GL_BLIT_VAO (f) = vao;
+  FRAME_GL_BLIT_TEX_UNIFORM (f) = tex_loc;
+
+  return true;
+}
+
+/* Destroy the blit shader resources.  Called from
+   pgtk_gl_area_unrealize.  */
+static void
+pgtk_destroy_blit_shader (struct frame *f)
+{
+  if (FRAME_GL_BLIT_PROGRAM (f))
+    {
+      glDeleteProgram (FRAME_GL_BLIT_PROGRAM (f));
+      FRAME_GL_BLIT_PROGRAM (f) = 0;
+    }
+  if (FRAME_GL_BLIT_VAO (f))
+    {
+      glDeleteVertexArrays (1, &FRAME_GL_BLIT_VAO (f));
+      FRAME_GL_BLIT_VAO (f) = 0;
+    }
+  FRAME_GL_BLIT_TEX_UNIFORM (f) = -1;
+}
+
 /* GtkGLArea "unrealize" callback - clean up GL resources when context
    is lost. This is critical for handling display sleep, window
    manager changes, or driver issues that invalidate the GL context.
@@ -9074,6 +9212,10 @@ pgtk_gl_area_unrealize (GtkGLArea *gl_area, gpointer user_data)
     emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
   if (FRAME_SKIA_GL_CONTEXT (f))
     emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+
+  /* Destroy the blit shader (GL resources, must be before context
+     destruction).  */
+  pgtk_destroy_blit_shader (f);
 
   /* Destroy Skia surface first (it references the GL context).  */
   if (FRAME_SKIA_SURFACE (f))
@@ -9176,6 +9318,16 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
   FRAME_GL_TIMEOUT_COUNT (f) = 0;
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
+
+  /* Create the blit shader for alpha-aware FBO-to-screen transfer.
+     This must be done before any rendering so the render callback can
+     use the shader instead of glBlitFramebuffer.  */
+  if (!pgtk_create_blit_shader (f))
+    {
+      fprintf (stderr, "Skia: Failed to create blit shader\n");
+      /* Fall back gracefully — render callback will use
+	 glBlitFramebuffer as a fallback (no alpha support).  */
+    }
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
 
@@ -9350,19 +9502,47 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
      frames that share their parent's GL context.  */
   glViewport (0, 0, dst_width, dst_height);
 
-  /* Disable blending for opaque blit.  */
+  /* Disable blending and scissor for the blit.  We write RGBA pixels
+     directly — the alpha channel will be passed through to GTK's
+     compositor for frame transparency (alpha-background).  */
   glDisable (GL_BLEND);
   glDisable (GL_SCISSOR_TEST);
 
-  /* Bind our FBO as the read framebuffer.  The GtkGLArea's FBO is
-     already bound as the draw framebuffer.  */
-  glBindFramebuffer (GL_READ_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
-
-  /* Blit the FBO to GtkGLArea's framebuffer.  Both FBOs use the same
-     OpenGL coordinate system (origin at bottom-left), so no Y-flip
-     is needed.  */
-  glBlitFramebuffer (0, 0, src_width, src_height, 0, 0, dst_width,
-		     dst_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  if (FRAME_GL_BLIT_PROGRAM (f))
+    {
+      /* Shader-based blit: draw a fullscreen triangle that samples our
+	 FBO texture.  This preserves the alpha channel (unlike
+	 glBlitFramebuffer to an RGB8 renderbuffer which discards it).
+	 GtkGLArea's internal FBO is RGBA8 (has_alpha=TRUE), so the
+	 compositor sees correct per-pixel alpha for transparency.  */
+      glUseProgram (FRAME_GL_BLIT_PROGRAM (f));
+      glActiveTexture (GL_TEXTURE0);
+      glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+		       GL_CLAMP_TO_EDGE);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+		       GL_CLAMP_TO_EDGE);
+      glUniform1i (FRAME_GL_BLIT_TEX_UNIFORM (f), 0);
+      glBindVertexArray (FRAME_GL_BLIT_VAO (f));
+      glDrawArrays (GL_TRIANGLES, 0, 3);
+      glBindVertexArray (0);
+      glBindTexture (GL_TEXTURE_2D, 0);
+      glUseProgram (0);
+    }
+  else
+    {
+      /* Fallback: glBlitFramebuffer if shader creation failed.
+	 This discards alpha (GtkGLArea FBO is RGBA but the blit
+	 path works correctly for opaque content).  */
+      glBindFramebuffer (GL_READ_FRAMEBUFFER,
+			 FRAME_GL_FRAMEBUFFER (f));
+      glBlitFramebuffer (0, 0, src_width, src_height, 0, 0,
+			 dst_width, dst_height,
+			 GL_COLOR_BUFFER_BIT, GL_LINEAR);
+      glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
+    }
 
   /* Wait for the blit to complete before returning to GTK.
      glFlush() merely submits commands to the GPU pipeline; on slower
@@ -9388,8 +9568,12 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
       glFlush ();
   }
 
-  /* Restore framebuffer bindings.  */
-  glBindFramebuffer (GL_READ_FRAMEBUFFER, 0);
+  /* Mark GL state as dirty.  After we return, GTK's
+     gdk_cairo_draw_from_gl (alpha compositing path) will trash GL
+     state (shaders, VAOs, textures, blend).  The next Skia draw in
+     pgtk_begin_skia_clip calls emacs_skia_gl_context_reset() which
+     fully recovers from this.  */
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
 
   return TRUE;
 }

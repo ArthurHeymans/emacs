@@ -460,6 +460,14 @@ struct pgtk_output
      after the first successful Emacs redisplay so that GTK's automatic
      first render doesn't composite an empty/transparent FBO.  */
   bool gl_area_shown;
+  /* GL blit shader resources for alpha-aware FBO-to-screen transfer.
+     Instead of glBlitFramebuffer (which discards alpha when the target
+     is RGB8), we use a fullscreen triangle with a trivial shader to
+     copy our RGBA FBO texture into GtkGLArea's RGBA FBO, preserving
+     alpha for compositor transparency.  */
+  unsigned int gl_blit_program;
+  unsigned int gl_blit_vao;
+  int gl_blit_tex_uniform;
 #endif
   struct atimer *atimer_visible_bell;
 
@@ -598,6 +606,12 @@ enum
    failures.  Prevents flooding stderr with identical error messages
    when the GL context is permanently broken.  */
 # define SKIA_MAX_SURFACE_CREATION_FAILURES 3
+# define FRAME_GL_BLIT_PROGRAM(f) \
+    ((f)->output_data.pgtk->gl_blit_program)
+# define FRAME_GL_BLIT_VAO(f) \
+    ((f)->output_data.pgtk->gl_blit_vao)
+# define FRAME_GL_BLIT_TEX_UNIFORM(f) \
+    ((f)->output_data.pgtk->gl_blit_tex_uniform)
 #endif
 
 
