@@ -365,7 +365,7 @@ extern "C"
   void emacs_skia_canvas_draw_image_rect (
     emacs_skia_canvas_t *canvas, emacs_skia_image_t *image,
     const emacs_skia_rect_t *src, const emacs_skia_rect_t *dst,
-    emacs_skia_paint_t *paint);
+    bool smooth, emacs_skia_paint_t *paint);
 
   /* Draw image with transformation applied.  */
   void emacs_skia_canvas_draw_image_transformed (

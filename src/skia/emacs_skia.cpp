@@ -1016,6 +1016,7 @@ emacs_skia_canvas_draw_image_rect (emacs_skia_canvas_t *canvas,
 				   emacs_skia_image_t *image,
 				   const emacs_skia_rect_t *src,
 				   const emacs_skia_rect_t *dst,
+				   bool smooth,
 				   emacs_skia_paint_t *paint)
 {
   if (!canvas || !canvas->canvas || !image || !image->image || !dst)
@@ -1023,7 +1024,8 @@ emacs_skia_canvas_draw_image_rect (emacs_skia_canvas_t *canvas,
       return;
     }
 
-  SkSamplingOptions sampling (SkFilterMode::kLinear);
+  SkSamplingOptions sampling (smooth ? SkFilterMode::kLinear
+				     : SkFilterMode::kNearest);
   SkRect sk_src = src ? to_sk_rect (src)
 		      : SkRect::MakeWH (image->image->width (),
 					image->image->height ());

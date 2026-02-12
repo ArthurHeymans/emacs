@@ -2622,7 +2622,7 @@ pgtk_skia_draw_image (struct frame *f, Emacs_GC *gc,
 			      EMACS_SKIA_COLOR (255, 255, 255, 255));
   emacs_skia_paint_set_blend_mode (paint, EMACS_SKIA_BLEND_SRC_OVER);
   emacs_skia_canvas_draw_image_rect (canvas, image, &src_rect,
-				     &dst_rect, paint);
+				     &dst_rect, true, paint);
 
   emacs_skia_canvas_restore (canvas);
   pgtk_end_skia_clip (f);
@@ -3842,7 +3842,14 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 {
 #ifdef USE_SKIA
   /* Skia version: snapshot the source region and draw to destination.
-   */
+
+     The Skia surface is at device-pixel resolution (logical * scale),
+     but src_rect/dst_rect are in logical pixel coordinates.  The
+     surface snapshot API operates in device pixels, so we must scale
+     the snapshot rectangle.  When drawing back, we use drawImageRect
+     to map the device-pixel snapshot into the logical-pixel
+     destination (the canvas scale transform then maps to device
+     pixels).  */
   emacs_skia_surface_t *skia_surface = FRAME_SKIA_SURFACE (f);
   if (skia_surface)
     {
@@ -3851,10 +3858,19 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 	 content if Skia has buffered draw operations.  */
       emacs_skia_surface_flush (skia_surface);
 
+      /* Scale source coordinates to device pixels for the surface
+	 snapshot.  The surface is at device-pixel resolution, so
+	 logical coordinates must be multiplied by the GTK scale
+	 factor.  */
+      int scale = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+
       emacs_skia_irect_t src_irect
-	= { (int) src_rect->x, (int) src_rect->y,
-	    (int) (src_rect->x + src_rect->width),
-	    (int) (src_rect->y + src_rect->height) };
+	= { (int) (src_rect->x * scale),
+	    (int) (src_rect->y * scale),
+	    (int) ((src_rect->x + src_rect->width) * scale),
+	    (int) ((src_rect->y + src_rect->height) * scale) };
 
       emacs_skia_image_t *snapshot
 	= emacs_skia_surface_make_image_snapshot_rect (skia_surface,
@@ -3882,17 +3898,21 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
 	  emacs_skia_paint_set_blend_mode (copy_paint,
 					   EMACS_SKIA_BLEND_SRC);
 
-	  /* Draw the snapshot at the destination position.  Use
-	     nearest neighbor sampling (smooth=false) for exact pixel
-	     copies without color interpolation artifacts.  */
-	  emacs_skia_canvas_draw_image_with_sampling (canvas,
-						      snapshot,
-						      (float)
-							dst_rect->x,
-						      (float)
-							dst_rect->y,
-						      false,
-						      copy_paint);
+	  /* Draw the device-pixel snapshot into the logical-pixel
+	     destination rectangle.  The canvas has a scale transform
+	     that maps logical to device pixels, so we must specify
+	     the destination in logical coordinates.  drawImageRect
+	     handles the scaling from the snapshot's device-pixel
+	     dimensions to the logical destination size.  Use nearest
+	     neighbor sampling (smooth=false) for exact pixel copies
+	     without color interpolation artifacts.  */
+	  emacs_skia_rect_t dst_sk
+	    = { (float) dst_rect->x, (float) dst_rect->y,
+		(float) (dst_rect->x + dst_rect->width),
+		(float) (dst_rect->y + dst_rect->height) };
+	  emacs_skia_canvas_draw_image_rect (canvas, snapshot,
+					     NULL, &dst_sk,
+					     false, copy_paint);
 
 	  emacs_skia_paint_destroy (copy_paint);
 	  pgtk_end_skia_clip (f);
