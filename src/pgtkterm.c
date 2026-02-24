@@ -9277,7 +9277,33 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
   if (!skia_surface)
     {
       /* Surface is NULL — during resize or before first redisplay.
-	 Nothing to composite.  Trigger a redraw once content exists.  */
+	 If the GL texture still has content from a previous frame,
+	 composite it rather than showing a black box.  The stale
+	 content is a much better placeholder than black until
+	 redisplay creates a new surface.  */
+      if (FRAME_GL_TEXTURE (f) && FRAME_GDK_GL_CONTEXT (f))
+	{
+	  GLint tex_w = 0, tex_h = 0;
+	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	  glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
+	  glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+				    &tex_w);
+	  glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+				    &tex_h);
+	  glBindTexture (GL_TEXTURE_2D, 0);
+
+	  if (tex_w > 0 && tex_h > 0)
+	    {
+	      scale = gtk_widget_get_scale_factor (widget);
+	      gdk_cairo_draw_from_gl (cr, gdk_window,
+				      FRAME_GL_TEXTURE (f),
+				      GL_TEXTURE,
+				      scale, 0, 0, tex_w, tex_h);
+	      FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+	    }
+	}
       SET_FRAME_GARBAGED (f);
       return FALSE;
     }
@@ -9619,10 +9645,14 @@ pgtk_skia_update_surface_desired_size (struct frame *f, int width,
   if (FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) != width
       || FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) != height || force)
     {
-      /* Only destroy the Skia surface, preserve the GL context.
-	 This avoids recreating the entire GL setup on every resize,
-	 which causes flickering.  */
-      pgtk_skia_destroy_surface_only (f);
+      /* Don't destroy the Skia surface here.  Keep the old surface
+	 alive so that the draw callback can still composite stale
+	 content instead of showing a black frame.  The surface will
+	 be recreated in pgtk_begin_skia_clip when it detects a size
+	 mismatch between the surface and the desired dimensions.
+	 This is analogous to Cairo's double-buffering via
+	 FRAME_CR_ACTIVE_CONTEXT, which keeps old content visible
+	 until new content is ready.  */
       FRAME_SKIA_SURFACE_DESIRED_WIDTH (f) = width;
       FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f) = height;
       SET_FRAME_GARBAGED (f);
@@ -9633,6 +9663,32 @@ emacs_skia_canvas_t *
 pgtk_begin_skia_clip (struct frame *f)
 {
   emacs_skia_canvas_t *canvas = FRAME_SKIA_CANVAS (f);
+
+  /* Check if the existing surface needs recreation due to a size
+     change.  pgtk_skia_update_surface_desired_size defers surface
+     destruction so that the draw callback can composite stale content
+     instead of showing black.  We detect the mismatch here and
+     destroy the old surface atomically before creating the new one.  */
+  if (canvas && FRAME_SKIA_SURFACE (f))
+    {
+      int scale = FRAME_GL_DRAWING_AREA (f)
+	? gtk_widget_get_scale_factor (FRAME_GL_DRAWING_AREA (f))
+	: 1;
+      int logical_w = FRAME_SKIA_SURFACE_DESIRED_WIDTH (f);
+      int logical_h = FRAME_SKIA_SURFACE_DESIRED_HEIGHT (f);
+      if (logical_w <= 0) logical_w = 1;
+      if (logical_h <= 0) logical_h = 1;
+      int desired_w = logical_w * scale;
+      int desired_h = logical_h * scale;
+      int cur_w = emacs_skia_surface_get_width (FRAME_SKIA_SURFACE (f));
+      int cur_h = emacs_skia_surface_get_height (FRAME_SKIA_SURFACE (f));
+
+      if (cur_w != desired_w || cur_h != desired_h)
+	{
+	  pgtk_skia_destroy_surface_only (f);
+	  canvas = NULL;
+	}
+    }
 
   if (!canvas)
     {
