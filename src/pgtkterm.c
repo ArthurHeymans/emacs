@@ -77,6 +77,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 
 #ifdef USE_SKIA
 # include <epoxy/gl.h> /* For GL types and functions */
+# ifdef GDK_WINDOWING_WAYLAND
+#  include <epoxy/egl.h> /* For eglGetCurrentContext */
+# endif
 # include "skia/emacs_skia.h"
 
 /* Convert Emacs pixel color (0xRRGGBB) to Skia color (0xAARRGGBB). */
@@ -85,6 +88,33 @@ pgtk_color_to_skia (unsigned long color)
 {
   return EMACS_SKIA_COLOR_RGB ((color >> 16) & 0xff,
 			       (color >> 8) & 0xff, color & 0xff);
+}
+
+/* Check whether the GL context for frame F is still valid after
+   calling gdk_gl_context_make_current.  On Wayland, GDK uses EGL
+   and eglMakeCurrent can silently fail when the compositor enters
+   a degraded state (output reconfiguration, shutdown).  GDK does
+   not expose this failure to callers.  If we proceed to call
+   Skia's flushAndSubmit, it invokes glGetError which triggers
+   Mesa's glthread to drain stale batched commands, causing a
+   SIGSEGV in the driver (tc_draw_user_indices_single).
+
+   We cannot use glGetError for detection because it triggers the
+   same crash.  Instead, on Wayland we check eglGetCurrentContext
+   — if eglMakeCurrent failed, the EGL spec says the previous
+   context stays current or becomes EGL_NO_CONTEXT.
+
+   On X11 (GLX), this crash path doesn't apply, so we always
+   return true.  */
+static bool
+pgtk_gl_context_valid_p (struct frame *f)
+{
+#ifdef GDK_WINDOWING_WAYLAND
+  GdkDisplay *dpy = gtk_widget_get_display (FRAME_GTK_WIDGET (f));
+  if (GDK_IS_WAYLAND_DISPLAY (dpy))
+    return eglGetCurrentContext () != EGL_NO_CONTEXT;
+#endif
+  return true;
 }
 
 /* Convert Emacs pixel color with explicit alpha to Skia color.  */
@@ -4354,11 +4384,20 @@ pgtk_frame_up_to_date (struct frame *f)
 
       FRAME_LAST_RENDER_TIME (f) = now;
 
-      /* Flush Skia first.  */
-      if (FRAME_SKIA_SURFACE (f))
-	emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
-      if (FRAME_SKIA_GL_CONTEXT (f))
-	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+      /* Make GL context current and validate it before flushing.
+	 See pgtk_gl_context_valid_p for why this is needed.  */
+      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+      if (pgtk_gl_context_valid_p (f))
+	{
+	  if (FRAME_SKIA_SURFACE (f))
+	    emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    emacs_skia_gl_context_flush
+	      (FRAME_SKIA_GL_CONTEXT (f));
+	}
+      else
+	SET_FRAME_GARBAGED (f);
 
       /* Queue a draw on the drawing area.  */
       if (FRAME_GL_DRAWING_AREA (f))
@@ -9037,11 +9076,16 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
 
   gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
-  /* Flush all pending GPU operations before destroying resources.  */
-  if (FRAME_SKIA_SURFACE (f))
-    emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
-  if (FRAME_SKIA_GL_CONTEXT (f))
-    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+  /* Flush all pending GPU operations before destroying resources,
+     but only if the GL context is still valid.  During compositor
+     shutdown the EGL context may already be lost.  */
+  if (pgtk_gl_context_valid_p (f))
+    {
+      if (FRAME_SKIA_SURFACE (f))
+	emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+    }
 
   /* Destroy pre-bell snapshot (holds GPU texture reference).  */
   if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
@@ -9283,33 +9327,46 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 	 redisplay creates a new surface.  */
       if (FRAME_GL_TEXTURE (f) && FRAME_GDK_GL_CONTEXT (f))
 	{
-	  GLint tex_w = 0, tex_h = 0;
 	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-	  if (FRAME_SKIA_GL_CONTEXT (f))
-	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-	  glBindTexture (GL_TEXTURE_2D, FRAME_GL_TEXTURE (f));
-	  glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-				    &tex_w);
-	  glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-				    &tex_h);
-	  glBindTexture (GL_TEXTURE_2D, 0);
 
-	  if (tex_w > 0 && tex_h > 0)
+	  if (pgtk_gl_context_valid_p (f))
 	    {
-	      scale = gtk_widget_get_scale_factor (widget);
-	      gdk_cairo_draw_from_gl (cr, gdk_window,
-				      FRAME_GL_TEXTURE (f),
-				      GL_TEXTURE,
-				      scale, 0, 0, tex_w, tex_h);
-	      FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+	      GLint tex_w = 0, tex_h = 0;
+	      if (FRAME_SKIA_GL_CONTEXT (f))
+		emacs_skia_gl_context_flush (
+		  FRAME_SKIA_GL_CONTEXT (f));
+	      glBindTexture (GL_TEXTURE_2D,
+			     FRAME_GL_TEXTURE (f));
+	      glGetTexLevelParameteriv (
+		GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_w);
+	      glGetTexLevelParameteriv (
+		GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
+	      glBindTexture (GL_TEXTURE_2D, 0);
+
+	      if (tex_w > 0 && tex_h > 0)
+		{
+		  scale = gtk_widget_get_scale_factor (widget);
+		  gdk_cairo_draw_from_gl (
+		    cr, gdk_window, FRAME_GL_TEXTURE (f),
+		    GL_TEXTURE, scale, 0, 0, tex_w, tex_h);
+		  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+		}
 	    }
 	}
       SET_FRAME_GARBAGED (f);
       return FALSE;
     }
 
-  /* Make our context current and flush Skia rendering.  */
+  /* Make our context current and flush Skia rendering.
+     Validate the GL context to avoid crashing if it was lost
+     (e.g. during compositor shutdown).  */
   gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+  if (!pgtk_gl_context_valid_p (f))
+    {
+      SET_FRAME_GARBAGED (f);
+      return FALSE;
+    }
 
   emacs_skia_surface_flush (skia_surface);
   if (FRAME_SKIA_GL_CONTEXT (f))
@@ -10010,11 +10067,14 @@ pgtk_skia_destroy_surface_only (struct frame *f)
     {
       /* For GL surfaces, make context current and flush before
 	 destroying to ensure any pending operations complete and
-	 the GrDirectContext state is clean.  */
+	 the GrDirectContext state is clean.  Skip the flush if
+	 the EGL context is lost — flushing with stale GL state
+	 would crash in the Mesa GL thread.  */
       if (FRAME_GDK_GL_CONTEXT (f))
 	{
 	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-	  if (FRAME_SKIA_GL_CONTEXT (f))
+	  if (pgtk_gl_context_valid_p (f)
+	      && FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 	      glFinish ();

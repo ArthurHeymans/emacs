@@ -450,6 +450,9 @@ emacs_skia_gl_context_destroy (emacs_skia_gl_context_t *ctx)
 void
 emacs_skia_gl_context_flush (emacs_skia_gl_context_t *ctx)
 {
+  /* IMPORTANT: Same caveat as emacs_skia_surface_flush — the
+     caller must ensure the GL context is valid and current.
+     See that function's comment for details.  */
   if (ctx && ctx->context)
     ctx->context->flushAndSubmit ();
 }
@@ -724,10 +727,15 @@ emacs_skia_surface_flush (emacs_skia_surface_t *surface)
 {
   if (surface && surface->surface)
     {
-      /* For raster surfaces (which we currently use), pixels are
-	 directly accessible and no flush is needed.  For GPU
-	 surfaces, we would need to call
-	 GrDirectContext::flushAndSubmit() instead.  */
+      /* IMPORTANT: The caller must ensure the GL context is valid
+	 and current before calling this function.  flushAndSubmit
+	 calls GrGLGpu::onSubmitToGpu which calls glGetError,
+	 triggering Mesa's glthread to drain pending commands.
+	 If the EGL context was lost (e.g. during compositor
+	 shutdown), those commands may reference stale/freed
+	 buffers, causing a SIGSEGV in the driver.  Callers
+	 should verify gdk_gl_context_get_current() matches
+	 their expected context before calling this.  */
 #ifdef SK_GL
       if (surface->context)
 	surface->context.get ()->flushAndSubmit ();
