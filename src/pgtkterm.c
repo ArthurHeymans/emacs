@@ -2449,6 +2449,9 @@ pgtk_draw_horizontal_wave (struct frame *f, unsigned long color,
   emacs_skia_paint_set_stroke (paint, true);
   emacs_skia_paint_set_stroke_width (paint, 1.0);
   emacs_skia_canvas_draw_path (canvas, path, paint);
+  /* Reset stroke mode on the shared paint object so subsequent draws
+     (which expect a filled paint) are not accidentally stroked.  */
+  emacs_skia_paint_set_stroke (paint, false);
   emacs_skia_canvas_restore (canvas);
   emacs_skia_path_destroy (path);
   pgtk_end_skia_clip (f);
@@ -3070,6 +3073,9 @@ pgtk_draw_dash (struct frame *f, struct glyph_string *s,
   emacs_skia_canvas_draw_line (canvas, s->x, y_center, s->x + width,
 			       y_center, paint);
   emacs_skia_paint_clear_dash (paint);
+  /* Reset stroke mode on the shared paint object so subsequent draws
+     (which expect a filled paint) are not accidentally stroked.  */
+  emacs_skia_paint_set_stroke (paint, false);
   pgtk_end_skia_clip (f);
 #else
   cairo_t *cr;
