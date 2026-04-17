@@ -13336,7 +13336,16 @@ clear_garbaged_frames (void)
 
 	  if (FRAME_REDISPLAY_P (f) && FRAME_GARBAGED_P (f))
 	    {
-	      if (f->resized_p
+	      if ((f->resized_p
+		  /* Skia keeps an offscreen surface alive across redisplay.
+		     When a pgtk frame is garbaged without being resized,
+		     partial redraw can leave stale pixels from the old frame
+		     contents visible.  Force a full redraw so the surface is
+		     cleared before repainting.  */
+#if defined HAVE_PGTK && defined USE_SKIA
+		  || FRAME_PGTK_P (f)
+#endif
+		  )
 		  /* It makes no sense to redraw a non-selected TTY
 		     frame, since that will actually clear the
 		     selected frame, and might leave the selected
