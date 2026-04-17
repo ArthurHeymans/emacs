@@ -9354,7 +9354,20 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 		  gdk_cairo_draw_from_gl (
 		    cr, gdk_window, FRAME_GL_TEXTURE (f),
 		    GL_TEXTURE, scale, 0, 0, tex_w, tex_h);
-		  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+		  /* gdk_cairo_draw_from_gl trashes shared GL state;
+		     mark every pgtk+Skia frame dirty (see comment in
+		     pgtk_gl_drawing_area_draw after the primary
+		     gdk_cairo_draw_from_gl call).  */
+		  {
+		    Lisp_Object tail, frame;
+		    FOR_EACH_FRAME (tail, frame)
+		      {
+			struct frame *ff = XFRAME (frame);
+			if (FRAME_PGTK_P (ff)
+			    && FRAME_SKIA_GL_CONTEXT (ff))
+			  FRAME_SKIA_GL_STATE_DIRTY (ff) = true;
+		      }
+		  }
 		}
 	    }
 	}
@@ -9406,12 +9419,24 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 			  GL_TEXTURE,
 			  scale, 0, 0, width, height);
 
-  /* Mark GL state as dirty.  gdk_cairo_draw_from_gl trashes GL state
-     (shaders, VAOs, textures, blend) in the paint context, and our
-     context is no longer current.  The next Skia draw in
-     pgtk_begin_skia_clip calls emacs_skia_gl_context_reset to
-     recover.  */
-  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  /* Mark GL state as dirty on every pgtk+Skia frame, not just this
+     one.  gdk_cairo_draw_from_gl trashes GL state (shaders, VAOs,
+     textures, blend) in the paint context, and our context is no
+     longer current.  All GdkGLContexts created by GDK on the same
+     display share objects (textures, buffers, programs) via a
+     display-level shared context, so the state perturbation affects
+     every frame's GrDirectContext, not only the one that just
+     composited.  Each frame's next pgtk_begin_skia_clip will honor
+     its dirty flag and call emacs_skia_gl_context_reset to recover.  */
+  {
+    Lisp_Object tail, frame;
+    FOR_EACH_FRAME (tail, frame)
+      {
+	struct frame *ff = XFRAME (frame);
+	if (FRAME_PGTK_P (ff) && FRAME_SKIA_GL_CONTEXT (ff))
+	  FRAME_SKIA_GL_STATE_DIRTY (ff) = true;
+      }
+  }
 
   return TRUE;
 }
@@ -9630,6 +9655,11 @@ pgtk_ensure_gl_framebuffer (struct frame *f, int width, int height,
       glBindFramebuffer (GL_FRAMEBUFFER, FRAME_GL_FRAMEBUFFER (f));
       GLenum status = glCheckFramebufferStatus (GL_FRAMEBUFFER);
       glBindFramebuffer (GL_FRAMEBUFFER, 0);
+      /* The bind/unbind pair above modifies the FRAMEBUFFER_BINDING
+	 GL state out from under Skia's cache, even though we don't
+	 recreate anything.  Mark the state dirty so the caller will
+	 reset Skia's GrDirectContext before drawing.  */
+      FRAME_SKIA_GL_STATE_DIRTY (f) = true;
       if (status != GL_FRAMEBUFFER_COMPLETE)
         {
           fprintf (stderr,
@@ -9973,15 +10003,16 @@ pgtk_begin_skia_clip (struct frame *f)
       int height = logical_h * sc;
 
       /* For GL surfaces, ensure the GL context is current before any
-	 drawing operations.  Skia's GL backend requires this.  */
+	 drawing operations.  Skia's GL backend requires this.
+	 Switching the GL context invalidates Skia's cached state; we
+	 handle that with the state-dirty check below.  */
       gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
 
-      /* Tell Skia to re-query GL state since GTK/GDK may have
-	 modified it between frames.  Without this, Skia's cached GL
-	 state may be stale and rendering may go to the wrong target.
-       */
-      if (FRAME_SKIA_GL_CONTEXT (f))
-	emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+      /* The context switch above (and any activity by another frame
+	 or by gdk_cairo_draw_from_gl before now) means Skia's cache
+	 of "currently bound GL state" is stale.  Mark it so the
+	 reset at the end of this function runs.  */
+      FRAME_SKIA_GL_STATE_DIRTY (f) = true;
 
       bool fbo_recreated = false;
       if (!pgtk_ensure_gl_framebuffer (f, width, height, &fbo_recreated))
@@ -9991,6 +10022,23 @@ pgtk_begin_skia_clip (struct frame *f)
 	  SET_FRAME_GARBAGED (f);
 	  return NULL;
 	}
+    }
+
+  /* Final GL-state sync before Skia draws.  Any path that leaves
+     FRAME_SKIA_GL_STATE_DIRTY set (context switch, FBO setup,
+     gdk_cairo_draw_from_gl in any frame, surface recreation, etc.)
+     funnels through this point.  resetContext() tells Skia to
+     re-query GL state on its next operation, so the first draw
+     unconditionally rebinds the FBO, program, VAO, blend, scissor
+     and stencil state to what Skia actually wants.  Without this,
+     Skia can issue draw calls whose cached state doesn't match the
+     actual GL context, producing malformed primitives (e.g., a
+     rectangle rendering as a collapsed triangle when a stale vertex
+     or scissor value is in effect).  */
+  if (FRAME_SKIA_GL_CONTEXT (f) && FRAME_SKIA_GL_STATE_DIRTY (f))
+    {
+      emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+      FRAME_SKIA_GL_STATE_DIRTY (f) = false;
     }
 
   emacs_skia_canvas_save (canvas);
