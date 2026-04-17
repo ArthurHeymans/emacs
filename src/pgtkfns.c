@@ -1554,15 +1554,21 @@ This function is an internal primitive--use `make-frame' instead.  */ )
 			 RES_TYPE_BOOLEAN);
   f->no_split = minibuffer_only || EQ (tem, Qt);
 
+#ifdef USE_SKIA
+  bool delay_realize_for_child_frame = !NILP (parent_frame);
+#else
+  bool delay_realize_for_child_frame = false;
+#endif
+
   xg_create_frame_widgets (f);
   pgtk_set_event_handler (f);
 
-  if (FRAME_GTK_OUTER_WIDGET (f))
+  if (!delay_realize_for_child_frame && FRAME_GTK_OUTER_WIDGET (f))
     gtk_widget_realize (FRAME_GTK_OUTER_WIDGET (f));
 
   /* Many callers (including the Lisp functions that call
      FRAME_SCALE_FACTOR) expect the widget to be realized.  */
-  if (FRAME_GTK_WIDGET (f))
+  if (!delay_realize_for_child_frame && FRAME_GTK_WIDGET (f))
     gtk_widget_realize (FRAME_GTK_WIDGET (f));
 
 #define INSTALL_CURSOR(FIELD, NAME) \
@@ -1638,6 +1644,14 @@ This function is an internal primitive--use `make-frame' instead.  */ )
       FRAME_OUTPUT_DATA (f)->ttip_window = NULL;
 
       unblock_input ();
+    }
+
+  if (delay_realize_for_child_frame && FRAME_GTK_WIDGET (f))
+    {
+      /* Skia child frames create a GL drawing area.  Realize it only
+         after the frame has been attached to its final parent so the
+         GdkWindow/GL context are created against the correct window.  */
+      gtk_widget_realize (FRAME_GTK_WIDGET (f));
     }
 
   if (FRAME_GTK_OUTER_WIDGET (f))

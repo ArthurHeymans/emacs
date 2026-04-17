@@ -6535,10 +6535,10 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
 	  gtk_widget_size_allocate (FRAME_GL_DRAWING_AREA (f), &gl_alloc);
 	}
       pgtk_skia_update_surface_desired_size (f, alloc->width,
-					     alloc->height, false);
+				     alloc->height, false);
 #else
       pgtk_cr_update_surface_desired_size (f, alloc->width,
-					   alloc->height, false);
+				   alloc->height, false);
 #endif
     }
 }
