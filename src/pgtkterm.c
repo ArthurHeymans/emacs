@@ -184,9 +184,8 @@ static void pgtk_skia_clip_to_row (struct window *,
 static void pgtk_skia_set_clip_rectangles (struct frame *,
 					   emacs_skia_canvas_t *,
 					   XRectangle *, int);
-static void
-pgtk_skia_set_glyph_string_clipping (struct glyph_string *,
-				     emacs_skia_canvas_t *);
+/* pgtk_skia_set_glyph_string_clipping is declared in pgtkterm.h so
+   that skiafont.c can use it.  */
 static void
 pgtk_skia_set_glyph_string_clipping_exactly (struct glyph_string *,
 					     struct glyph_string *,
@@ -1353,7 +1352,7 @@ pgtk_set_glyph_string_gc (struct glyph_string *s)
    line or menu if we don't have X toolkit support.  */
 
 #ifdef USE_SKIA
-static void
+void
 pgtk_skia_set_glyph_string_clipping (struct glyph_string *s,
 				     emacs_skia_canvas_t *canvas)
 {

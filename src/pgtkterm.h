@@ -702,6 +702,8 @@ extern void pgtk_end_skia_clip (struct frame *);
 extern void pgtk_skia_set_paint_foreground (struct frame *, Emacs_GC *);
 extern void pgtk_skia_set_paint_background (struct frame *, Emacs_GC *);
 extern void pgtk_skia_set_paint_color (struct frame *, unsigned long, bool);
+extern void pgtk_skia_set_glyph_string_clipping (struct glyph_string *,
+						 emacs_skia_canvas_t *);
 extern void pgtk_skia_draw_frame (struct frame *);
 extern Lisp_Object pgtk_skia_export_frames (Lisp_Object frames, Lisp_Object type);
 extern void pgtk_skia_destroy_frame_context (struct frame *);

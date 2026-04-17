@@ -574,19 +574,13 @@ skiafont_draw (struct glyph_string *s, int from, int to, int x, int y,
     }
 
   /* Apply clipping from glyph string to prevent drawing outside
-     bounds.  */
-  {
-    XRectangle clip_rects[2];
-    int n = get_glyph_string_clip_rects (s, clip_rects, 2);
-    for (int j = 0; j < n; j++)
-      {
-	emacs_skia_irect_t clip
-	  = { clip_rects[j].x, clip_rects[j].y,
-	      clip_rects[j].x + clip_rects[j].width,
-	      clip_rects[j].y + clip_rects[j].height };
-	emacs_skia_canvas_clip_irect (canvas, &clip);
-      }
-  }
+     bounds.  Use the shared helper so that when
+     get_glyph_string_clip_rects returns multiple rectangles (the
+     OVERLAPS case), the clip is the UNION of those rectangles rather
+     than their intersection.  Skia's canvas->clipRect intersects by
+     default, so calling it in a loop over disjoint rectangles would
+     produce an empty clip region and drop drawing.  */
+  pgtk_skia_set_glyph_string_clipping (s, canvas);
 
   emacs_skia_paint_t *paint = FRAME_SKIA_PAINT (f);
 
