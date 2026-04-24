@@ -90,30 +90,48 @@ pgtk_color_to_skia (unsigned long color)
 			       (color >> 8) & 0xff, color & 0xff);
 }
 
-/* Check whether the GL context for frame F is still valid after
-   calling gdk_gl_context_make_current.  On Wayland, GDK uses EGL
-   and eglMakeCurrent can silently fail when the compositor enters
-   a degraded state (output reconfiguration, shutdown).  GDK does
-   not expose this failure to callers.  If we proceed to call
-   Skia's flushAndSubmit, it invokes glGetError which triggers
-   Mesa's glthread to drain stale batched commands, causing a
-   SIGSEGV in the driver (tc_draw_user_indices_single).
+/* Make F's GDK GL context current and verify that it really became
+   current before any GL or GL-backed Skia operation.
 
-   We cannot use glGetError for detection because it triggers the
-   same crash.  Instead, on Wayland we check eglGetCurrentContext
-   — if eglMakeCurrent failed, the EGL spec says the previous
-   context stays current or becomes EGL_NO_CONTEXT.
+   GDK's gdk_gl_context_make_current returns void.  On Wayland, its
+   internal eglMakeCurrent can fail while only logging a warning.  A
+   naive eglGetCurrentContext () != EGL_NO_CONTEXT check is not enough:
+   the EGL spec allows the previous current context to remain current
+   after failure.  Clear the current context first so that a failed
+   make-current cannot be mistaken for success because of a stale
+   frame or GDK paint context.
 
-   On X11 (GLX), this crash path doesn't apply, so we always
-   return true.  */
+   Do not call glGetError here; on the broken-context path it can
+   itself flush stale Mesa glthread commands and crash in the driver.  */
 static bool
-pgtk_gl_context_valid_p (struct frame *f)
+pgtk_frame_gl_context_make_current (struct frame *f)
 {
+  GdkGLContext *ctx = FRAME_GDK_GL_CONTEXT (f);
+  if (!ctx)
+    return false;
+
 #ifdef GDK_WINDOWING_WAYLAND
   GdkDisplay *dpy = gtk_widget_get_display (FRAME_GTK_WIDGET (f));
-  if (GDK_IS_WAYLAND_DISPLAY (dpy))
-    return eglGetCurrentContext () != EGL_NO_CONTEXT;
+  bool wayland = GDK_IS_WAYLAND_DISPLAY (dpy);
+
+  if (wayland)
+    {
+      gdk_gl_context_clear_current ();
+      if (eglGetCurrentContext () != EGL_NO_CONTEXT)
+	return false;
+    }
 #endif
+
+  gdk_gl_context_make_current (ctx);
+
+  if (gdk_gl_context_get_current () != ctx)
+    return false;
+
+#ifdef GDK_WINDOWING_WAYLAND
+  if (wayland && eglGetCurrentContext () == EGL_NO_CONTEXT)
+    return false;
+#endif
+
   return true;
 }
 
@@ -129,13 +147,8 @@ pgtk_skia_make_gl_context_current (struct frame *f)
   if (!FRAME_GDK_GL_CONTEXT (f))
     return true;
 
-  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-
-  if (!pgtk_gl_context_valid_p (f))
-    {
-      SET_FRAME_GARBAGED (f);
-      return false;
-    }
+  if (!pgtk_frame_gl_context_make_current (f))
+    return false;
 
   if (FRAME_SKIA_GL_CONTEXT (f))
     {
@@ -4413,7 +4426,8 @@ pgtk_frame_up_to_date (struct frame *f)
 	     synchronization.  Previously this just returned, which
 	     could cause visual freezes if no more
 	     pgtk_frame_up_to_date calls occurred.  */
-	  if (FRAME_GL_DRAWING_AREA (f))
+	  if (FRAME_GL_DRAWING_AREA (f)
+	      && pgtk_frame_gl_context_make_current (f))
 	    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
 	  unblock_input ();
 	  return;
@@ -4423,14 +4437,17 @@ pgtk_frame_up_to_date (struct frame *f)
 
       /* Make GL context current and validate it before flushing.
 	 See pgtk_skia_make_gl_context_current for why this is needed.  */
-      if (pgtk_skia_make_gl_context_current (f))
+      if (!pgtk_skia_make_gl_context_current (f))
 	{
-	  if (FRAME_SKIA_SURFACE (f))
-	    emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
-	  if (FRAME_SKIA_GL_CONTEXT (f))
-	    emacs_skia_gl_context_flush
-	      (FRAME_SKIA_GL_CONTEXT (f));
+	  unblock_input ();
+	  return;
 	}
+
+      if (FRAME_SKIA_SURFACE (f))
+	emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	emacs_skia_gl_context_flush
+	  (FRAME_SKIA_GL_CONTEXT (f));
 
       /* Queue a draw on the drawing area.  */
       if (FRAME_GL_DRAWING_AREA (f))
@@ -4906,17 +4923,19 @@ pgtk_flush_display (struct frame *f)
 #ifdef USE_SKIA
   /* Flush Skia surface to ensure all drawing commands are complete
      before we blit to the screen.  */
-  if (FRAME_SKIA_SURFACE (f)
-      && pgtk_skia_make_gl_context_current (f))
+  if (FRAME_SKIA_SURFACE (f))
     {
+      if (!pgtk_skia_make_gl_context_current (f))
+	return;
+
       emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-    }
 
-  /* Queue a render to display the completed content.  */
-  if (FRAME_GL_DRAWING_AREA (f))
-    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+      /* Queue a render to display the completed content.  */
+      if (FRAME_GL_DRAWING_AREA (f))
+	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+    }
 #endif
 }
 
@@ -4975,6 +4994,13 @@ recover_from_visible_bell (struct atimer *timer)
 #ifdef USE_SKIA
   block_input ();
 
+  if (!pgtk_skia_make_gl_context_current (f))
+    {
+      FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+      unblock_input ();
+      goto out;
+    }
+
   /* Restore the pre-flash surface content from the saved snapshot.
      The snapshot is at device-pixel resolution; temporarily undo the
      canvas HiDPI scale so the image maps 1:1 to device pixels.  */
@@ -5018,6 +5044,7 @@ recover_from_visible_bell (struct atimer *timer)
     }
 #endif
 
+ out:
   if (FRAME_X_OUTPUT (f)->atimer_visible_bell != NULL)
     FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
 }
@@ -5037,6 +5064,12 @@ pgtk_flash (struct frame *f)
     return;
 
   block_input ();
+
+  if (!pgtk_skia_make_gl_context_current (f))
+    {
+      unblock_input ();
+      return;
+    }
 
   /* Draw the flash effect directly onto the main GL-backed Skia
      surface.  The canvas already has the HiDPI scale transform, so
@@ -6238,15 +6271,16 @@ pgtk_buffer_flipping_unblocked_hook (struct frame *f)
   /* For Skia GL, queue a draw on the drawing area.  */
   if (FRAME_SKIA_SURFACE (f))
     {
-      /* Flush Skia first.  */
+      /* Flush Skia first.  Do not queue another draw if the GL
+	 context cannot be made current; that feeds an EGL failure loop.  */
       if (pgtk_skia_make_gl_context_current (f))
 	{
 	  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
 	  if (FRAME_SKIA_GL_CONTEXT (f))
 	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	  if (FRAME_GL_DRAWING_AREA (f))
+	    gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
 	}
-      if (FRAME_GL_DRAWING_AREA (f))
-	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
     }
   else
 #endif
@@ -9111,30 +9145,37 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
   if (!FRAME_GDK_GL_CONTEXT (f))
     return;
 
-  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+  bool have_current = pgtk_frame_gl_context_make_current (f);
 
-  /* Flush all pending GPU operations before destroying resources,
-     but only if the GL context is still valid.  During compositor
-     shutdown the EGL context may already be lost.  */
-  if (pgtk_gl_context_valid_p (f))
+  /* Flush and destroy GPU-backed objects only if the frame context
+     really is current.  During compositor shutdown or context loss,
+     GL cleanup is less important than avoiding wrong-context GL calls
+     and redraw loops.  */
+  if (have_current)
     {
       if (FRAME_SKIA_SURFACE (f))
 	emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
       if (FRAME_SKIA_GL_CONTEXT (f))
 	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
-    }
 
-  /* Destroy pre-bell snapshot (holds GPU texture reference).  */
-  if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
+      /* Destroy pre-bell snapshot (holds GPU texture reference).  */
+      if (FRAME_X_OUTPUT (f)->skia_image_pre_bell)
+	{
+	  emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
+	  FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+	}
+
+      /* Destroy Skia surface first (it references the GL context).  */
+      if (FRAME_SKIA_SURFACE (f))
+	{
+	  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+	  FRAME_SKIA_SURFACE (f) = NULL;
+	  FRAME_SKIA_CANVAS (f) = NULL;
+	}
+    }
+  else
     {
-      emacs_skia_image_destroy (FRAME_X_OUTPUT (f)->skia_image_pre_bell);
       FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
-    }
-
-  /* Destroy Skia surface first (it references the GL context).  */
-  if (FRAME_SKIA_SURFACE (f))
-    {
-      emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
       FRAME_SKIA_SURFACE (f) = NULL;
       FRAME_SKIA_CANVAS (f) = NULL;
     }
@@ -9146,33 +9187,43 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
       FRAME_SKIA_PAINT (f) = NULL;
     }
 
-  /* Destroy the Skia GL context.  */
-  if (FRAME_SKIA_GL_CONTEXT (f))
+  /* Destroy GL-backed resources only with a verified current context.  */
+  if (have_current)
     {
-      emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
-      FRAME_SKIA_GL_CONTEXT (f) = NULL;
-    }
+      if (FRAME_SKIA_GL_CONTEXT (f))
+	{
+	  emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
+	  FRAME_SKIA_GL_CONTEXT (f) = NULL;
+	}
 
-  /* Delete GL resources we own.  */
-  if (FRAME_GL_FRAMEBUFFER (f))
+      if (FRAME_GL_FRAMEBUFFER (f))
+	{
+	  glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+	  FRAME_GL_FRAMEBUFFER (f) = 0;
+	}
+      if (FRAME_GL_TEXTURE (f))
+	{
+	  glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
+	  FRAME_GL_TEXTURE (f) = 0;
+	}
+      if (FRAME_GL_STENCIL (f))
+	{
+	  glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
+	  FRAME_GL_STENCIL (f) = 0;
+	}
+
+      gdk_gl_context_clear_current ();
+    }
+  else
     {
-      glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+      FRAME_SKIA_GL_CONTEXT (f) = NULL;
       FRAME_GL_FRAMEBUFFER (f) = 0;
-    }
-  if (FRAME_GL_TEXTURE (f))
-    {
-      glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
       FRAME_GL_TEXTURE (f) = 0;
-    }
-  if (FRAME_GL_STENCIL (f))
-    {
-      glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
       FRAME_GL_STENCIL (f) = 0;
     }
 
   /* We own this context (created via gdk_window_create_gl_context),
      so unref it.  */
-  gdk_gl_context_clear_current ();
   g_object_unref (FRAME_GDK_GL_CONTEXT (f));
   FRAME_GDK_GL_CONTEXT (f) = NULL;
 
@@ -9234,7 +9285,12 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
     }
 
   FRAME_GDK_GL_CONTEXT (f) = gl_context;
-  gdk_gl_context_make_current (gl_context);
+  if (!pgtk_frame_gl_context_make_current (f))
+    {
+      g_object_unref (gl_context);
+      FRAME_GDK_GL_CONTEXT (f) = NULL;
+      return;
+    }
 
   /* Clear any pending GL errors.  */
   while (glGetError () != GL_NO_ERROR)
@@ -9357,6 +9413,8 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 
   if (!skia_surface)
     {
+      bool have_current = true;
+
       /* Surface is NULL — during resize or before first redisplay.
 	 If the GL texture still has content from a previous frame,
 	 composite it rather than showing a black box.  The stale
@@ -9364,9 +9422,9 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 	 redisplay creates a new surface.  */
       if (FRAME_GL_TEXTURE (f) && FRAME_GDK_GL_CONTEXT (f))
 	{
-	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  have_current = pgtk_frame_gl_context_make_current (f);
 
-	  if (pgtk_gl_context_valid_p (f))
+	  if (have_current)
 	    {
 	      GLint tex_w = 0, tex_h = 0;
 	      if (FRAME_SKIA_GL_CONTEXT (f))
@@ -9403,7 +9461,8 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
 		}
 	    }
 	}
-      SET_FRAME_GARBAGED (f);
+      if (have_current)
+	SET_FRAME_GARBAGED (f);
       return FALSE;
     }
 
@@ -9563,7 +9622,8 @@ pgtk_setup_gl_framebuffer (struct frame *f, int width, int height)
     return false;
 
   /* Make the GL context current.  */
-  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+  if (!pgtk_frame_gl_context_make_current (f))
+    return false;
 
   /* Clear any stale GL errors before starting.  */
   while (glGetError () != GL_NO_ERROR)
@@ -9717,37 +9777,49 @@ pgtk_ensure_gl_framebuffer (struct frame *f, int width, int height,
 static void
 pgtk_cleanup_gl_context (struct frame *f)
 {
-  if (FRAME_SKIA_GL_CONTEXT (f))
-    {
-      emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
-      FRAME_SKIA_GL_CONTEXT (f) = NULL;
-    }
-
   if (FRAME_GDK_GL_CONTEXT (f))
     {
-      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+      bool have_current = pgtk_frame_gl_context_make_current (f);
 
-      if (FRAME_GL_FRAMEBUFFER (f))
+      if (have_current)
 	{
-	  glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    {
+	      emacs_skia_gl_context_destroy (FRAME_SKIA_GL_CONTEXT (f));
+	      FRAME_SKIA_GL_CONTEXT (f) = NULL;
+	    }
+
+	  if (FRAME_GL_FRAMEBUFFER (f))
+	    {
+	      glDeleteFramebuffers (1, &FRAME_GL_FRAMEBUFFER (f));
+	      FRAME_GL_FRAMEBUFFER (f) = 0;
+	    }
+	  if (FRAME_GL_TEXTURE (f))
+	    {
+	      glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
+	      FRAME_GL_TEXTURE (f) = 0;
+	    }
+	  if (FRAME_GL_STENCIL (f))
+	    {
+	      glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
+	      FRAME_GL_STENCIL (f) = 0;
+	    }
+
+	  gdk_gl_context_clear_current ();
+	}
+      else
+	{
+	  FRAME_SKIA_GL_CONTEXT (f) = NULL;
 	  FRAME_GL_FRAMEBUFFER (f) = 0;
-	}
-      if (FRAME_GL_TEXTURE (f))
-	{
-	  glDeleteTextures (1, &FRAME_GL_TEXTURE (f));
 	  FRAME_GL_TEXTURE (f) = 0;
-	}
-      if (FRAME_GL_STENCIL (f))
-	{
-	  glDeleteRenderbuffers (1, &FRAME_GL_STENCIL (f));
 	  FRAME_GL_STENCIL (f) = 0;
 	}
 
-      /* We created this context ourselves, so unref it.  */
-      gdk_gl_context_clear_current ();
       g_object_unref (FRAME_GDK_GL_CONTEXT (f));
       FRAME_GDK_GL_CONTEXT (f) = NULL;
     }
+  else
+    FRAME_SKIA_GL_CONTEXT (f) = NULL;
 
   FRAME_GL_DRAWING_AREA (f) = NULL;
 
@@ -9843,7 +9915,8 @@ pgtk_begin_skia_clip (struct frame *f)
       if (FRAME_GL_DRAWING_AREA (f) && FRAME_GDK_GL_CONTEXT (f))
 	{
 	  /* Make our GL context current.  */
-	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  if (!pgtk_frame_gl_context_make_current (f))
+	    return NULL;
 
 	  /* Clear any stale GL errors.  */
 	  while (glGetError () != GL_NO_ERROR)
@@ -9912,7 +9985,8 @@ pgtk_begin_skia_clip (struct frame *f)
 	       && pgtk_ensure_gl_framebuffer (f, width, height, NULL))
 	{
 	  /* Make GL context current.  */
-	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+	  if (!pgtk_frame_gl_context_make_current (f))
+	    return NULL;
 
 	  /* Clear any stale GL errors.  */
 	  while (glGetError () != GL_NO_ERROR)
@@ -10033,7 +10107,8 @@ pgtk_begin_skia_clip (struct frame *f)
 	 drawing operations.  Skia's GL backend requires this.
 	 Switching the GL context invalidates Skia's cached state; we
 	 handle that with the state-dirty check below.  */
-      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+      if (!pgtk_frame_gl_context_make_current (f))
+	return NULL;
 
       /* The context switch above (and any activity by another frame
 	 or by gdk_cairo_draw_from_gl before now) means Skia's cache
@@ -10147,29 +10222,26 @@ pgtk_skia_destroy_surface_only (struct frame *f)
     {
       /* For GL surfaces, make context current and flush before
 	 destroying to ensure any pending operations complete and
-	 the GrDirectContext state is clean.  Skip the flush if
-	 the EGL context is lost — flushing with stale GL state
-	 would crash in the Mesa GL thread.  */
+	 the GrDirectContext state is clean.  If the EGL context is
+	 lost, fail closed: abandon the wrapper references rather than
+	 issuing GL calls against a stale or wrong context.  */
+      bool can_destroy = true;
       if (FRAME_GDK_GL_CONTEXT (f))
 	{
-	  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-	  if (pgtk_gl_context_valid_p (f)
-	      && FRAME_SKIA_GL_CONTEXT (f))
+	  can_destroy = pgtk_frame_gl_context_make_current (f);
+	  if (can_destroy && FRAME_SKIA_GL_CONTEXT (f))
 	    {
 	      emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
 	      glFinish ();
 	    }
 	}
-      emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
-      FRAME_SKIA_SURFACE (f) = NULL;
-
-      /* Reset the GrDirectContext state after destroying the surface.
-	 This clears Skia's internal caches that may reference the
-	 old surface's backend render target.  */
-      if (FRAME_SKIA_GL_CONTEXT (f))
+      if (can_destroy)
 	{
-	  emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+	  emacs_skia_surface_destroy (FRAME_SKIA_SURFACE (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
 	}
+      FRAME_SKIA_SURFACE (f) = NULL;
     }
 }
 
