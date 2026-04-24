@@ -1,0 +1,5 @@
+{
+  "disabledServers": ["cpp"],
+  "disabledFormatters": ["clang-format"],
+  "disabledExtensions": [".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".ino"]
+}

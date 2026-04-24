@@ -117,6 +117,35 @@ pgtk_gl_context_valid_p (struct frame *f)
   return true;
 }
 
+/* Make F's GL context current before touching an existing GL-backed
+   Skia object.  Most drawing goes through pgtk_begin_skia_clip, but
+   copy_bits snapshots the surface directly.  With multiple pgtk
+   frames, the current context may belong to another monitor's frame
+   (or to GDK's paint context), and flushing/snapshotting with the
+   wrong current EGL context can corrupt that other frame.  */
+static bool
+pgtk_skia_make_gl_context_current (struct frame *f)
+{
+  if (!FRAME_GDK_GL_CONTEXT (f))
+    return true;
+
+  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
+
+  if (!pgtk_gl_context_valid_p (f))
+    {
+      SET_FRAME_GARBAGED (f);
+      return false;
+    }
+
+  if (FRAME_SKIA_GL_CONTEXT (f))
+    {
+      emacs_skia_gl_context_reset (FRAME_SKIA_GL_CONTEXT (f));
+      FRAME_SKIA_GL_STATE_DIRTY (f) = false;
+    }
+
+  return true;
+}
+
 /* Convert Emacs pixel color with explicit alpha to Skia color.  */
 static inline emacs_skia_color_t
 pgtk_color_to_skia_alpha (unsigned long color, uint8_t alpha)
@@ -3888,6 +3917,9 @@ pgtk_copy_bits (struct frame *f, cairo_rectangle_t *src_rect,
   emacs_skia_surface_t *skia_surface = FRAME_SKIA_SURFACE (f);
   if (skia_surface)
     {
+      if (!pgtk_skia_make_gl_context_current (f))
+	return;
+
       /* Flush the surface to ensure all pending draws are committed
 	 before taking a snapshot.  Without this, we might read stale
 	 content if Skia has buffered draw operations.  */
@@ -4390,10 +4422,8 @@ pgtk_frame_up_to_date (struct frame *f)
       FRAME_LAST_RENDER_TIME (f) = now;
 
       /* Make GL context current and validate it before flushing.
-	 See pgtk_gl_context_valid_p for why this is needed.  */
-      gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-
-      if (pgtk_gl_context_valid_p (f))
+	 See pgtk_skia_make_gl_context_current for why this is needed.  */
+      if (pgtk_skia_make_gl_context_current (f))
 	{
 	  if (FRAME_SKIA_SURFACE (f))
 	    emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
@@ -4401,8 +4431,6 @@ pgtk_frame_up_to_date (struct frame *f)
 	    emacs_skia_gl_context_flush
 	      (FRAME_SKIA_GL_CONTEXT (f));
 	}
-      else
-	SET_FRAME_GARBAGED (f);
 
       /* Queue a draw on the drawing area.  */
       if (FRAME_GL_DRAWING_AREA (f))
@@ -4878,7 +4906,8 @@ pgtk_flush_display (struct frame *f)
 #ifdef USE_SKIA
   /* Flush Skia surface to ensure all drawing commands are complete
      before we blit to the screen.  */
-  if (FRAME_SKIA_SURFACE (f))
+  if (FRAME_SKIA_SURFACE (f)
+      && pgtk_skia_make_gl_context_current (f))
     {
       emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
       if (FRAME_SKIA_GL_CONTEXT (f))
@@ -6210,9 +6239,12 @@ pgtk_buffer_flipping_unblocked_hook (struct frame *f)
   if (FRAME_SKIA_SURFACE (f))
     {
       /* Flush Skia first.  */
-      emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
-      if (FRAME_SKIA_GL_CONTEXT (f))
-	emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+      if (pgtk_skia_make_gl_context_current (f))
+	{
+	  emacs_skia_surface_flush (FRAME_SKIA_SURFACE (f));
+	  if (FRAME_SKIA_GL_CONTEXT (f))
+	    emacs_skia_gl_context_flush (FRAME_SKIA_GL_CONTEXT (f));
+	}
       if (FRAME_GL_DRAWING_AREA (f))
 	gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
     }
@@ -9378,13 +9410,8 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
   /* Make our context current and flush Skia rendering.
      Validate the GL context to avoid crashing if it was lost
      (e.g. during compositor shutdown).  */
-  gdk_gl_context_make_current (FRAME_GDK_GL_CONTEXT (f));
-
-  if (!pgtk_gl_context_valid_p (f))
-    {
-      SET_FRAME_GARBAGED (f);
-      return FALSE;
-    }
+  if (!pgtk_skia_make_gl_context_current (f))
+    return FALSE;
 
   emacs_skia_surface_flush (skia_surface);
   if (FRAME_SKIA_GL_CONTEXT (f))
