@@ -137,8 +137,57 @@ pgtk_abandon_gl_context (struct frame *f)
 }
 
 static void
+pgtk_log_gl_frame_state (const char *event, struct frame *f)
+{
+  GtkWidget *frame_widget = FRAME_GTK_WIDGET (f);
+  GtkWidget *drawing_area = FRAME_GL_DRAWING_AREA (f);
+  GtkAllocation alloc = { 0, 0, 0, 0 };
+  GdkWindow *gdk_window = NULL;
+  int scale = 0;
+
+  if (drawing_area)
+    {
+      gtk_widget_get_allocation (drawing_area, &alloc);
+      scale = gtk_widget_get_scale_factor (drawing_area);
+      gdk_window = gtk_widget_get_window (drawing_area);
+    }
+
+  const char *name = STRINGP (f->name) ? SSDATA (f->name) : "<non-string>";
+
+  fprintf (stderr,
+	   "Skia GL %s: frame=%p name=%s ctx=%p current=%p "
+	   "drawing_area=%p realized=%d mapped=%d visible=%d "
+	   "frame_widget=%p frame_realized=%d frame_mapped=%d "
+	   "gdk_window=%p alloc=%dx%d+%d+%d scale=%d "
+	   "child=%d tooltip=%d failures=%d lost=%d",
+	   event, (void *) f, name, (void *) FRAME_GDK_GL_CONTEXT (f),
+	   (void *) gdk_gl_context_get_current (), (void *) drawing_area,
+	   drawing_area ? gtk_widget_get_realized (drawing_area) : 0,
+	   drawing_area ? gtk_widget_get_mapped (drawing_area) : 0,
+	   drawing_area ? gtk_widget_get_visible (drawing_area) : 0,
+	   (void *) frame_widget,
+	   frame_widget ? gtk_widget_get_realized (frame_widget) : 0,
+	   frame_widget ? gtk_widget_get_mapped (frame_widget) : 0,
+	   (void *) gdk_window, alloc.width, alloc.height, alloc.x, alloc.y,
+	   scale, FRAME_PARENT_FRAME (f) != NULL, f->tooltip,
+	   FRAME_GL_MAKE_CURRENT_FAILURES (f),
+	   FRAME_SKIA_GL_CONTEXT_LOST (f));
+
+#ifdef GDK_WINDOWING_WAYLAND
+  if (frame_widget
+      && GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (frame_widget)))
+    fprintf (stderr, " egl_current=%p", (void *) eglGetCurrentContext ());
+#endif
+
+  fputc ('\n', stderr);
+}
+
+static void
 pgtk_note_gl_make_current_failure (struct frame *f)
 {
+  if (FRAME_GL_MAKE_CURRENT_FAILURES (f) == 0)
+    pgtk_log_gl_frame_state ("make-current-failed", f);
+
   FRAME_GL_MAKE_CURRENT_FAILURES (f)++;
   if (FRAME_GL_MAKE_CURRENT_FAILURES (f)
       >= SKIA_MAX_GL_MAKE_CURRENT_FAILURES)
@@ -9215,6 +9264,8 @@ pgtk_gl_drawing_area_unrealize (GtkWidget *widget, gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
 
+  pgtk_log_gl_frame_state ("unrealize", f);
+
   if (!FRAME_GDK_GL_CONTEXT (f))
     return;
 
@@ -9326,6 +9377,8 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
   gdk_window = gtk_widget_get_window (widget);
   if (!gdk_window)
     return;
+
+  pgtk_log_gl_frame_state ("realize-start", f);
 
   /* Create a GL context from the GdkWindow.  This context shares
      objects with the window's internal paint context, so our textures
@@ -9465,6 +9518,8 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
 	    }
 	}
     }
+
+  pgtk_log_gl_frame_state ("realize-ready", f);
 }
 
 /* Drawing area "draw" callback — composite our FBO texture to the
