@@ -442,13 +442,10 @@ struct pgtk_output
      concurrent drawing during the flash window.  */
   emacs_skia_image_t *skia_image_pre_bell;
   bool skia_gl_initialized;
-  /* Skia GL rendering support.  We use a GtkDrawingArea with an
-     explicit GdkGLContext (created via gdk_window_create_gl_context)
-     instead of GtkGLArea.  Skia renders into our own FBO, and the
-     draw callback hands the FBO texture directly to
-     gdk_cairo_draw_from_gl for compositing — eliminating the extra
-     FBO copy that GtkGLArea's internal FBO would require.  */
-  GtkWidget *gl_drawing_area;
+  /* Skia GL rendering support.  GtkGLArea owns the GDK GL context
+     and GTK presentation lifecycle; Skia renders into our offscreen
+     FBO, which the render callback blits into GtkGLArea's FBO.  */
+  GtkWidget *gl_area;
   GdkGLContext *gdk_gl_context;
   unsigned int gl_framebuffer;
   unsigned int gl_texture;
@@ -457,12 +454,17 @@ struct pgtk_output
   /* Track when GL state needs reset - avoids unnecessary resetContext calls.  */
   bool skia_gl_state_dirty;
   /* Count consecutive GL make-current failures.  After several
-     failures, abandon the current GL objects and try to recreate them
-     from the still-realized drawing area instead of repeatedly logging
-     eglMakeCurrent failures and leaving the frame blank.  */
+     failures, abandon the current GL objects and recreate the
+     GtkGLArea instead of repeatedly logging eglMakeCurrent failures
+     and leaving the frame blank.  */
   int gl_make_current_failures;
   gint64 gl_context_recreate_after;
   bool skia_gl_context_lost;
+  /* GL blit shader resources for alpha-aware FBO-to-GtkGLArea
+     transfer.  */
+  unsigned int gl_blit_program;
+  unsigned int gl_blit_vao;
+  int gl_blit_tex_uniform;
   /* Count consecutive GL surface creation failures.  After
      SKIA_MAX_SURFACE_CREATION_FAILURES consecutive failures, we stop
      attempting surface creation to avoid flooding stderr.  Reset to 0
@@ -592,7 +594,7 @@ enum
     ((f)->output_data.pgtk->skia_surface_desired_height)
 # define FRAME_SKIA_GL_INITIALIZED(f) \
      ((f)->output_data.pgtk->skia_gl_initialized)
-# define FRAME_GL_DRAWING_AREA(f) ((f)->output_data.pgtk->gl_drawing_area)
+# define FRAME_GL_AREA(f) ((f)->output_data.pgtk->gl_area)
 # define FRAME_GDK_GL_CONTEXT(f) ((f)->output_data.pgtk->gdk_gl_context)
 # define FRAME_GL_FRAMEBUFFER(f) ((f)->output_data.pgtk->gl_framebuffer)
 # define FRAME_GL_TEXTURE(f) ((f)->output_data.pgtk->gl_texture)
@@ -607,6 +609,12 @@ enum
     ((f)->output_data.pgtk->skia_gl_context_lost)
 # define FRAME_GL_SURFACE_CREATION_FAILURES(f) \
     ((f)->output_data.pgtk->gl_surface_creation_failures)
+# define FRAME_GL_BLIT_PROGRAM(f) \
+    ((f)->output_data.pgtk->gl_blit_program)
+# define FRAME_GL_BLIT_VAO(f) \
+    ((f)->output_data.pgtk->gl_blit_vao)
+# define FRAME_GL_BLIT_TEX_UNIFORM(f) \
+    ((f)->output_data.pgtk->gl_blit_tex_uniform)
 /* Stop attempting GL make-current/surface creation after this many
    consecutive failures.  Prevents flooding stderr with identical
    error messages when the GL context is permanently broken.  */
