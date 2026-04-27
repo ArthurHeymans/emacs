@@ -456,6 +456,13 @@ struct pgtk_output
   gint64 last_render_time;
   /* Track when GL state needs reset - avoids unnecessary resetContext calls.  */
   bool skia_gl_state_dirty;
+  /* Count consecutive GL make-current failures.  After several
+     failures, abandon the current GL objects and try to recreate them
+     from the still-realized drawing area instead of repeatedly logging
+     eglMakeCurrent failures and leaving the frame blank.  */
+  int gl_make_current_failures;
+  gint64 gl_context_recreate_after;
+  bool skia_gl_context_lost;
   /* Count consecutive GL surface creation failures.  After
      SKIA_MAX_SURFACE_CREATION_FAILURES consecutive failures, we stop
      attempting surface creation to avoid flooding stderr.  Reset to 0
@@ -592,11 +599,18 @@ enum
 # define FRAME_GL_STENCIL(f) ((f)->output_data.pgtk->gl_stencil)
 # define FRAME_LAST_RENDER_TIME(f) ((f)->output_data.pgtk->last_render_time)
 # define FRAME_SKIA_GL_STATE_DIRTY(f) ((f)->output_data.pgtk->skia_gl_state_dirty)
+# define FRAME_GL_MAKE_CURRENT_FAILURES(f) \
+    ((f)->output_data.pgtk->gl_make_current_failures)
+# define FRAME_GL_CONTEXT_RECREATE_AFTER(f) \
+    ((f)->output_data.pgtk->gl_context_recreate_after)
+# define FRAME_SKIA_GL_CONTEXT_LOST(f) \
+    ((f)->output_data.pgtk->skia_gl_context_lost)
 # define FRAME_GL_SURFACE_CREATION_FAILURES(f) \
     ((f)->output_data.pgtk->gl_surface_creation_failures)
-/* Stop attempting GL surface creation after this many consecutive
-   failures.  Prevents flooding stderr with identical error messages
-   when the GL context is permanently broken.  */
+/* Stop attempting GL make-current/surface creation after this many
+   consecutive failures.  Prevents flooding stderr with identical
+   error messages when the GL context is permanently broken.  */
+# define SKIA_MAX_GL_MAKE_CURRENT_FAILURES 3
 # define SKIA_MAX_SURFACE_CREATION_FAILURES 3
 
 #endif

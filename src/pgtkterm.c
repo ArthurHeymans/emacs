@@ -90,6 +90,69 @@ pgtk_color_to_skia (unsigned long color)
 			       (color >> 8) & 0xff, color & 0xff);
 }
 
+/* Abandon frame F's current GL objects after repeated make-current
+   failures.  This intentionally avoids GL calls: the context is known
+   not to be current, and trying to delete GPU objects here can either
+   crash or feed the EGL failure loop.  The realized drawing area can
+   create a fresh GdkGLContext on the next redisplay.  */
+static void
+pgtk_abandon_gl_context (struct frame *f)
+{
+  if (FRAME_SKIA_GL_CONTEXT_LOST (f))
+    return;
+
+  fprintf (stderr,
+	   "Skia: abandoning lost GL context for frame %p after %d "
+	   "make-current failures\n",
+	   (void *) f, FRAME_GL_MAKE_CURRENT_FAILURES (f));
+
+  FRAME_X_OUTPUT (f)->skia_image_pre_bell = NULL;
+  FRAME_SKIA_SURFACE (f) = NULL;
+  FRAME_SKIA_CANVAS (f) = NULL;
+
+  if (FRAME_SKIA_PAINT (f))
+    {
+      emacs_skia_paint_destroy (FRAME_SKIA_PAINT (f));
+      FRAME_SKIA_PAINT (f) = NULL;
+    }
+
+  FRAME_SKIA_GL_CONTEXT (f) = NULL;
+  FRAME_GL_FRAMEBUFFER (f) = 0;
+  FRAME_GL_TEXTURE (f) = 0;
+  FRAME_GL_STENCIL (f) = 0;
+
+  if (FRAME_GDK_GL_CONTEXT (f))
+    {
+      g_object_unref (FRAME_GDK_GL_CONTEXT (f));
+      FRAME_GDK_GL_CONTEXT (f) = NULL;
+    }
+
+  FRAME_SKIA_GL_INITIALIZED (f) = false;
+  FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  FRAME_SKIA_GL_CONTEXT_LOST (f) = true;
+  FRAME_GL_CONTEXT_RECREATE_AFTER (f) = g_get_monotonic_time () + 1000000;
+  FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
+
+  SET_FRAME_GARBAGED (f);
+}
+
+static void
+pgtk_note_gl_make_current_failure (struct frame *f)
+{
+  FRAME_GL_MAKE_CURRENT_FAILURES (f)++;
+  if (FRAME_GL_MAKE_CURRENT_FAILURES (f)
+      >= SKIA_MAX_GL_MAKE_CURRENT_FAILURES)
+    pgtk_abandon_gl_context (f);
+}
+
+static void
+pgtk_note_gl_make_current_success (struct frame *f)
+{
+  FRAME_GL_MAKE_CURRENT_FAILURES (f) = 0;
+  FRAME_GL_CONTEXT_RECREATE_AFTER (f) = 0;
+  FRAME_SKIA_GL_CONTEXT_LOST (f) = false;
+}
+
 /* Make F's GDK GL context current and verify that it really became
    current before any GL or GL-backed Skia operation.
 
@@ -107,7 +170,7 @@ static bool
 pgtk_frame_gl_context_make_current (struct frame *f)
 {
   GdkGLContext *ctx = FRAME_GDK_GL_CONTEXT (f);
-  if (!ctx)
+  if (!ctx || FRAME_SKIA_GL_CONTEXT_LOST (f))
     return false;
 
 #ifdef GDK_WINDOWING_WAYLAND
@@ -118,20 +181,30 @@ pgtk_frame_gl_context_make_current (struct frame *f)
     {
       gdk_gl_context_clear_current ();
       if (eglGetCurrentContext () != EGL_NO_CONTEXT)
-	return false;
+	{
+	  pgtk_note_gl_make_current_failure (f);
+	  return false;
+	}
     }
 #endif
 
   gdk_gl_context_make_current (ctx);
 
   if (gdk_gl_context_get_current () != ctx)
-    return false;
+    {
+      pgtk_note_gl_make_current_failure (f);
+      return false;
+    }
 
 #ifdef GDK_WINDOWING_WAYLAND
   if (wayland && eglGetCurrentContext () == EGL_NO_CONTEXT)
-    return false;
+    {
+      pgtk_note_gl_make_current_failure (f);
+      return false;
+    }
 #endif
 
+  pgtk_note_gl_make_current_success (f);
   return true;
 }
 
@@ -9285,10 +9358,16 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
     }
 
   FRAME_GDK_GL_CONTEXT (f) = gl_context;
+  FRAME_SKIA_GL_CONTEXT_LOST (f) = false;
+  FRAME_GL_CONTEXT_RECREATE_AFTER (f) = 0;
+  FRAME_GL_MAKE_CURRENT_FAILURES (f) = 0;
   if (!pgtk_frame_gl_context_make_current (f))
     {
-      g_object_unref (gl_context);
-      FRAME_GDK_GL_CONTEXT (f) = NULL;
+      if (FRAME_GDK_GL_CONTEXT (f))
+	{
+	  g_object_unref (FRAME_GDK_GL_CONTEXT (f));
+	  FRAME_GDK_GL_CONTEXT (f) = NULL;
+	}
       return;
     }
 
@@ -9319,6 +9398,9 @@ pgtk_gl_drawing_area_realize (GtkWidget *widget, gpointer user_data)
 
   /* Initialize GL state as dirty so Skia resets on first use.  */
   FRAME_SKIA_GL_STATE_DIRTY (f) = true;
+  FRAME_GL_MAKE_CURRENT_FAILURES (f) = 0;
+  FRAME_GL_CONTEXT_RECREATE_AFTER (f) = 0;
+  FRAME_SKIA_GL_CONTEXT_LOST (f) = false;
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   FRAME_SKIA_GL_INITIALIZED (f) = true;
@@ -9600,17 +9682,27 @@ pgtk_resize_fbo_preserve_content (struct frame *f, int old_width,
   glBindFramebuffer (GL_FRAMEBUFFER, 0);
 }
 
-/* Legacy init function — now the GL context is created in
-   pgtk_gl_drawing_area_realize.  This is kept for the fallback path
-   in pgtk_begin_skia_clip.  */
+/* Ensure F has a GL context.  Normally the drawing area's realize
+   callback creates it.  If a previously working context was abandoned
+   after EGL make-current failures while the widget stayed realized,
+   retry creation here from the existing GdkWindow.  */
 static bool
 pgtk_init_gl_context (struct frame *f)
 {
   if (FRAME_SKIA_GL_INITIALIZED (f))
     return FRAME_GDK_GL_CONTEXT (f) != NULL;
 
-  /* The drawing area realize callback handles initialization.
-     If we get here without a context, it hasn't realized yet.  */
+  if (FRAME_SKIA_GL_CONTEXT_LOST (f)
+      && g_get_monotonic_time () < FRAME_GL_CONTEXT_RECREATE_AFTER (f))
+    return false;
+
+  if (FRAME_GL_DRAWING_AREA (f)
+      && gtk_widget_get_realized (FRAME_GL_DRAWING_AREA (f)))
+    {
+      pgtk_gl_drawing_area_realize (FRAME_GL_DRAWING_AREA (f), f);
+      return FRAME_GDK_GL_CONTEXT (f) != NULL;
+    }
+
   return false;
 }
 
