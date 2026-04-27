@@ -82,6 +82,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # endif
 # include "skia/emacs_skia.h"
 
+static gboolean pgtk_gl_context_recreate_cb (gpointer);
+
 /* Convert Emacs pixel color (0xRRGGBB) to Skia color (0xAARRGGBB). */
 static inline emacs_skia_color_t
 pgtk_color_to_skia (unsigned long color)
@@ -134,6 +136,8 @@ pgtk_abandon_gl_context (struct frame *f)
   FRAME_GL_SURFACE_CREATION_FAILURES (f) = 0;
 
   SET_FRAME_GARBAGED (f);
+  if (FRAME_GL_DRAWING_AREA (f))
+    g_timeout_add (1000, pgtk_gl_context_recreate_cb, f);
 }
 
 static void
@@ -180,6 +184,21 @@ pgtk_log_gl_frame_state (const char *event, struct frame *f)
 #endif
 
   fputc ('\n', stderr);
+}
+
+static gboolean
+pgtk_gl_context_recreate_cb (gpointer user_data)
+{
+  struct frame *f = (struct frame *) user_data;
+
+  if (FRAME_PGTK_P (f) && FRAME_GL_DRAWING_AREA (f))
+    {
+      FRAME_GL_CONTEXT_RECREATE_AFTER (f) = 0;
+      SET_FRAME_GARBAGED (f);
+      gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+    }
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
@@ -4529,6 +4548,14 @@ pgtk_frame_up_to_date (struct frame *f)
 #ifdef USE_SKIA
   /* For Skia GL rendering, bypass the buffer_flipping_blocked check
      since we don't use Cairo's double-buffering mechanism.  */
+  if (FRAME_GL_DRAWING_AREA (f)
+      && (!FRAME_GDK_GL_CONTEXT (f) || !FRAME_GL_TEXTURE (f)))
+    {
+      gtk_widget_queue_draw (FRAME_GL_DRAWING_AREA (f));
+      unblock_input ();
+      return;
+    }
+
   if (FRAME_GDK_GL_CONTEXT (f) && FRAME_GL_TEXTURE (f))
     {
       /* Frame pacing: limit to ~60 FPS (16.6ms) to reduce flickering
@@ -8493,6 +8520,7 @@ static void pgtk_gl_drawing_area_unrealize (GtkWidget *, gpointer);
 static gboolean pgtk_gl_drawing_area_draw (GtkWidget *, cairo_t *,
 					   gpointer);
 static bool pgtk_setup_gl_framebuffer (struct frame *, int, int);
+static bool pgtk_init_gl_context (struct frame *);
 static bool pgtk_check_gl_error (const char *);
 #endif
 
@@ -9540,7 +9568,10 @@ pgtk_gl_drawing_area_draw (GtkWidget *widget, cairo_t *cr,
   int width, height, scale;
 
   if (!FRAME_GDK_GL_CONTEXT (f) || !FRAME_GL_TEXTURE (f))
-    return FALSE;
+    {
+      if (!pgtk_init_gl_context (f) || !FRAME_GL_TEXTURE (f))
+	return FALSE;
+    }
 
   gdk_window = gtk_widget_get_window (widget);
   if (!gdk_window)
