@@ -93,11 +93,38 @@ pgtk_color_to_skia (unsigned long color)
 			       (color >> 8) & 0xff, color & 0xff);
 }
 
-static void
+static bool
+pgtk_gl_area_ready_for_gl (struct frame *f)
+{
+  GtkWidget *gl_area = FRAME_GL_AREA (f);
+  if (!gl_area)
+    return false;
+
+  if (!gtk_widget_get_realized (gl_area)
+      || !gtk_widget_get_mapped (gl_area)
+      || !gtk_widget_get_visible (gl_area)
+      || !gtk_widget_get_window (gl_area))
+    return false;
+
+  GtkAllocation alloc = { 0, 0, 0, 0 };
+  gtk_widget_get_allocation (gl_area, &alloc);
+  return alloc.width > 0 && alloc.height > 0;
+}
+
+static bool
 pgtk_queue_gl_render (struct frame *f)
 {
-  if (FRAME_GL_AREA (f))
-    gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+  if (!FRAME_GL_AREA (f))
+    return false;
+
+  if (!pgtk_gl_area_ready_for_gl (f))
+    {
+      SET_FRAME_GARBAGED (f);
+      return false;
+    }
+
+  gtk_gl_area_queue_render (GTK_GL_AREA (FRAME_GL_AREA (f)));
+  return true;
 }
 
 /* Abandon frame F's current GL objects after repeated make-current
@@ -254,6 +281,12 @@ pgtk_frame_gl_context_make_current (struct frame *f)
 
   if (FRAME_GL_AREA (f))
     {
+      if (!pgtk_gl_area_ready_for_gl (f))
+	{
+	  SET_FRAME_GARBAGED (f);
+	  return false;
+	}
+
       gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
       GError *gl_error = gtk_gl_area_get_error (GTK_GL_AREA (FRAME_GL_AREA (f)));
       if (gl_error != NULL)
@@ -7254,12 +7287,16 @@ map_event (GtkWidget *widget, GdkEvent *event, gpointer *user_data)
 #ifdef USE_SKIA
       /* Wayland compositors may discard surface content when windows
 	 are unmapped.  Mark as garbaged so Emacs redisplay redraws
-	 the content.  Do NOT queue a draw here — redisplay
-	 hasn't run yet, so the render callback would blit a stale or
-	 empty surface.  pgtk_frame_up_to_date will queue the render
-	 after content has been drawn.  */
+	 the content.  Also queue a GtkGLArea render once the widget is
+	 mapped: if redisplay tried to draw while the GL area had no valid
+	 EGL surface, that update was deliberately deferred.  The render
+	 callback can then bootstrap the GLArea and, if needed, leave the
+	 frame garbaged for a real content redraw.  */
       if (FRAME_GL_AREA (f))
-	SET_FRAME_GARBAGED (f);
+	{
+	  SET_FRAME_GARBAGED (f);
+	  pgtk_queue_gl_render (f);
+	}
 #endif
 
       if (iconified)
@@ -9542,10 +9579,17 @@ pgtk_gl_area_realize (GtkGLArea *gl_area, gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
 
-  if (FRAME_GDK_GL_CONTEXT (f))
+  if (FRAME_GDK_GL_CONTEXT (f) && FRAME_SKIA_GL_INITIALIZED (f))
     return;
 
   pgtk_log_gl_frame_state ("realize-start", f);
+
+  if (!pgtk_gl_area_ready_for_gl (f))
+    {
+      pgtk_log_gl_frame_state ("realize-deferred", f);
+      SET_FRAME_GARBAGED (f);
+      return;
+    }
 
   gtk_gl_area_make_current (gl_area);
   GError *gl_error = gtk_gl_area_get_error (gl_area);
@@ -9658,8 +9702,14 @@ pgtk_gl_area_render (GtkGLArea *gl_area, GdkGLContext *context,
 		     gpointer user_data)
 {
   struct frame *f = (struct frame *) user_data;
-  emacs_skia_surface_t *skia_surface = FRAME_SKIA_SURFACE (f);
+  emacs_skia_surface_t *skia_surface;
   (void) context;
+
+  if ((!FRAME_GDK_GL_CONTEXT (f) || !FRAME_SKIA_GL_INITIALIZED (f))
+      && pgtk_gl_area_ready_for_gl (f))
+    pgtk_gl_area_realize (gl_area, f);
+
+  skia_surface = FRAME_SKIA_SURFACE (f);
 
   if (!pgtk_frame_gl_context_make_current (f))
     return TRUE;
@@ -9838,6 +9888,13 @@ pgtk_gl_area_resize (GtkGLArea *gl_area, gint width, gint height,
   if (width <= 0 || height <= 0)
     return;
 
+  if (!FRAME_SKIA_GL_INITIALIZED (f))
+    {
+      pgtk_gl_area_realize (gl_area, f);
+      if (!FRAME_SKIA_GL_INITIALIZED (f))
+	return;
+    }
+
   if (!pgtk_frame_gl_context_make_current (f))
     return;
 
@@ -9894,8 +9951,7 @@ pgtk_init_gl_context (struct frame *f)
       && g_get_monotonic_time () < FRAME_GL_CONTEXT_RECREATE_AFTER (f))
     return false;
 
-  if (FRAME_GL_AREA (f)
-      && gtk_widget_get_realized (FRAME_GL_AREA (f)))
+  if (FRAME_GL_AREA (f) && pgtk_gl_area_ready_for_gl (f))
     {
       pgtk_gl_area_realize (GTK_GL_AREA (FRAME_GL_AREA (f)), f);
       return FRAME_GDK_GL_CONTEXT (f) != NULL;
