@@ -264,6 +264,82 @@ pgtk_note_gl_make_current_success (struct frame *f)
   FRAME_SKIA_GL_CONTEXT_LOST (f) = false;
 }
 
+#ifdef GDK_WINDOWING_WAYLAND
+static const char *
+pgtk_egl_error_name (EGLint error)
+{
+  switch (error)
+    {
+    case EGL_SUCCESS: return "EGL_SUCCESS";
+    case EGL_NOT_INITIALIZED: return "EGL_NOT_INITIALIZED";
+    case EGL_BAD_ACCESS: return "EGL_BAD_ACCESS";
+    case EGL_BAD_ALLOC: return "EGL_BAD_ALLOC";
+    case EGL_BAD_ATTRIBUTE: return "EGL_BAD_ATTRIBUTE";
+    case EGL_BAD_CONTEXT: return "EGL_BAD_CONTEXT";
+    case EGL_BAD_CONFIG: return "EGL_BAD_CONFIG";
+    case EGL_BAD_CURRENT_SURFACE: return "EGL_BAD_CURRENT_SURFACE";
+    case EGL_BAD_DISPLAY: return "EGL_BAD_DISPLAY";
+    case EGL_BAD_SURFACE: return "EGL_BAD_SURFACE";
+    case EGL_BAD_MATCH: return "EGL_BAD_MATCH";
+    case EGL_BAD_PARAMETER: return "EGL_BAD_PARAMETER";
+    case EGL_BAD_NATIVE_PIXMAP: return "EGL_BAD_NATIVE_PIXMAP";
+    case EGL_BAD_NATIVE_WINDOW: return "EGL_BAD_NATIVE_WINDOW";
+    case EGL_CONTEXT_LOST: return "EGL_CONTEXT_LOST";
+    default: return "UNKNOWN";
+    }
+}
+
+static void
+pgtk_egl_clear_error (void)
+{
+  while (eglGetError () != EGL_SUCCESS)
+    ;
+}
+
+static bool
+pgtk_egl_make_current_succeeded (struct frame *f, const char *where)
+{
+  GdkDisplay *dpy = gtk_widget_get_display (FRAME_GTK_WIDGET (f));
+  if (!GDK_IS_WAYLAND_DISPLAY (dpy))
+    return true;
+
+  EGLint egl_error = eglGetError ();
+  if (egl_error != EGL_SUCCESS)
+    {
+      fprintf (stderr,
+	       "Skia: EGL error after GtkGLArea make-current in %s: "
+	       "%s (0x%x)\n",
+	       where, pgtk_egl_error_name (egl_error), (unsigned) egl_error);
+      return false;
+    }
+
+  if (eglGetCurrentContext () == EGL_NO_CONTEXT)
+    return false;
+
+  EGLSurface surface = eglGetCurrentSurface (EGL_DRAW);
+  if (surface == EGL_NO_SURFACE)
+    return false;
+
+  EGLDisplay egl_display = eglGetCurrentDisplay ();
+  EGLint width = 0, height = 0;
+  pgtk_egl_clear_error ();
+  if (!eglQuerySurface (egl_display, surface, EGL_WIDTH, &width)
+      || eglGetError () != EGL_SUCCESS
+      || !eglQuerySurface (egl_display, surface, EGL_HEIGHT, &height)
+      || eglGetError () != EGL_SUCCESS
+      || width <= 0 || height <= 0)
+    {
+      fprintf (stderr,
+	       "Skia: invalid EGL draw surface after GtkGLArea make-current "
+	       "in %s: surface=%p size=%dx%d\n",
+	       where, (void *) surface, width, height);
+      return false;
+    }
+
+  return true;
+}
+#endif
+
 /* Make F's GtkGLArea-owned GDK GL context current and verify that it
    really became current before any GL or GL-backed Skia operation.
 
@@ -287,6 +363,16 @@ pgtk_frame_gl_context_make_current (struct frame *f)
 	  return false;
 	}
 
+#ifdef GDK_WINDOWING_WAYLAND
+      if (gtk_widget_get_display (FRAME_GTK_WIDGET (f))
+	  && GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (FRAME_GTK_WIDGET (f))))
+	{
+	  if (gdk_gl_context_get_current ())
+	    gdk_gl_context_clear_current ();
+	  pgtk_egl_clear_error ();
+	}
+#endif
+
       gtk_gl_area_make_current (GTK_GL_AREA (FRAME_GL_AREA (f)));
       GError *gl_error = gtk_gl_area_get_error (GTK_GL_AREA (FRAME_GL_AREA (f)));
       if (gl_error != NULL)
@@ -296,6 +382,13 @@ pgtk_frame_gl_context_make_current (struct frame *f)
 	  pgtk_note_gl_make_current_failure (f);
 	  return false;
 	}
+#ifdef GDK_WINDOWING_WAYLAND
+      if (!pgtk_egl_make_current_succeeded (f, "frame"))
+	{
+	  pgtk_note_gl_make_current_failure (f);
+	  return false;
+	}
+#endif
       ctx = gtk_gl_area_get_context (GTK_GL_AREA (FRAME_GL_AREA (f)));
       FRAME_GDK_GL_CONTEXT (f) = ctx;
       if (!ctx)
