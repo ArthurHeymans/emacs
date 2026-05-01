@@ -303,36 +303,69 @@ pgtk_egl_make_current_succeeded (struct frame *f, const char *where)
   if (!GDK_IS_WAYLAND_DISPLAY (dpy))
     return true;
 
-  EGLint egl_error = eglGetError ();
-  if (egl_error != EGL_SUCCESS)
+  EGLint make_current_error = eglGetError ();
+
+  if (eglGetCurrentContext () == EGL_NO_CONTEXT)
     {
-      fprintf (stderr,
-	       "Skia: EGL error after GtkGLArea make-current in %s: "
-	       "%s (0x%x)\n",
-	       where, pgtk_egl_error_name (egl_error), (unsigned) egl_error);
+      if (make_current_error != EGL_SUCCESS)
+	fprintf (stderr,
+		 "Skia: EGL error after GtkGLArea make-current in %s: "
+		 "%s (0x%x)\n",
+		 where, pgtk_egl_error_name (make_current_error),
+		 (unsigned) make_current_error);
       return false;
     }
 
-  if (eglGetCurrentContext () == EGL_NO_CONTEXT)
-    return false;
-
   EGLSurface surface = eglGetCurrentSurface (EGL_DRAW);
   if (surface == EGL_NO_SURFACE)
-    return false;
+    {
+      if (make_current_error != EGL_SUCCESS)
+	fprintf (stderr,
+		 "Skia: EGL error after GtkGLArea make-current in %s: "
+		 "%s (0x%x), no draw surface\n",
+		 where, pgtk_egl_error_name (make_current_error),
+		 (unsigned) make_current_error);
+      return false;
+    }
 
   EGLDisplay egl_display = eglGetCurrentDisplay ();
   EGLint width = 0, height = 0;
   pgtk_egl_clear_error ();
-  if (!eglQuerySurface (egl_display, surface, EGL_WIDTH, &width)
-      || eglGetError () != EGL_SUCCESS
-      || !eglQuerySurface (egl_display, surface, EGL_HEIGHT, &height)
-      || eglGetError () != EGL_SUCCESS
+  gboolean queried_width = eglQuerySurface (egl_display, surface,
+					    EGL_WIDTH, &width);
+  EGLint width_error = eglGetError ();
+  gboolean queried_height = eglQuerySurface (egl_display, surface,
+					     EGL_HEIGHT, &height);
+  EGLint height_error = eglGetError ();
+  if (!queried_width || width_error != EGL_SUCCESS
+      || !queried_height || height_error != EGL_SUCCESS
       || width <= 0 || height <= 0)
     {
       fprintf (stderr,
 	       "Skia: invalid EGL draw surface after GtkGLArea make-current "
-	       "in %s: surface=%p size=%dx%d\n",
-	       where, (void *) surface, width, height);
+	       "in %s: prior=%s (0x%x) surface=%p size=%dx%d "
+	       "query-width=%s (0x%x) query-height=%s (0x%x)\n",
+	       where, pgtk_egl_error_name (make_current_error),
+	       (unsigned) make_current_error, (void *) surface, width, height,
+	       pgtk_egl_error_name (width_error), (unsigned) width_error,
+	       pgtk_egl_error_name (height_error), (unsigned) height_error);
+      return false;
+    }
+
+  /* GDK's Wayland make-current path calls eglSwapInterval(0) after a
+     successful eglMakeCurrent.  Some Mesa/EWM combinations report
+     EGL_BAD_SURFACE for that swap-interval call even though the context
+     and draw surface are current and queryable.  Treat that as a noisy
+     presentation warning, not as a failed make-current, or every frame
+     is rejected and Emacs never draws.  */
+  if (make_current_error != EGL_SUCCESS
+      && make_current_error != EGL_BAD_SURFACE)
+    {
+      fprintf (stderr,
+	       "Skia: EGL error after GtkGLArea make-current in %s: "
+	       "%s (0x%x)\n",
+	       where, pgtk_egl_error_name (make_current_error),
+	       (unsigned) make_current_error);
       return false;
     }
 
